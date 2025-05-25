@@ -3,32 +3,59 @@ import cv2
 import numpy as np
 import time
 import argparse
-import math
-import os
-import sys
+import math, torch
 from config import config
-from predict_steering import predict_steering_angle
+from model import NvidiaModel
+
 
 # --- Global variable for actor cleanup ---
 actor_list = []
 
+model_class = NvidiaModel
+model = model_class()
+model.load_state_dict(torch.load("./save_new/model.pt", map_location=torch.device(config.device)))
+model.to(config.device)
+model.eval()
+
+def predict_steering_angle(carla_image_bgr):
+    """
+    Process CARLA image to match exact training pipeline
+    """
+    # Convert BGR to YUV (match training)
+    image_yuv = cv2.cvtColor(carla_image_bgr, cv2.COLOR_BGR2YUV)
+    
+    # Resize to exact training dimensions
+    image_resized = cv2.resize(image_yuv, (200, 66))  # Width, Height
+    
+    # Convert to torch tensor with training normalization
+    image = np.transpose(image_resized, (2, 0, 1))
+    image = torch.from_numpy(image).float()
+    image = (image / 127.5) - 1.0  # Match training normalization
+    
+    # Add batch dimension and move to device
+    image = image.unsqueeze(0).to(config.device)
+    
+    # Predict
+    with torch.no_grad():
+        prediction = model(image)
+    
+    return prediction.item()  # Returns angle in radians
+
 def carla_image_to_rgb_array(carla_image):
     """
-    Converts a CARLA image (BGRA) to an RGB NumPy array (H, W, C).
-    This matches what the training pipeline expects.
+    Converts a CARLA image to match training data format.
+    Training data was saved as BGR, so we need to maintain consistency.
     """
     if not carla_image:
         return None
     
-    # Convert CARLA's raw data to numpy array
     raw_data = np.frombuffer(carla_image.raw_data, dtype=np.uint8)
     bgra_image = raw_data.reshape((carla_image.height, carla_image.width, 4))
     
-    # Remove alpha channel and convert BGRA to RGB
-    bgr_image = bgra_image[:, :, :3]  # Remove alpha
-    rgb_image = cv2.cvtColor(bgr_image, cv2.COLOR_BGR2RGB)
+    # Remove alpha channel - keep as BGR to match training
+    bgr_image = bgra_image[:, :, :3]  
+    return bgr_image
     
-    return rgb_image
 
 def cleanup_actors():
     """Destroys all actors in the global actor_list."""
@@ -70,7 +97,7 @@ def main(args):
             return
         
         # spawn_point = spawn_points[10] longest [28] longest 2 [30] longest 3  [49] longesttt 4 [51] longest 5
-        spawn_point = spawn_points[51]
+        spawn_point = spawn_points[10]
         vehicle = world.try_spawn_actor(vehicle_bp, spawn_point)
         if vehicle is None:
             print("Error: Could not spawn vehicle.")
@@ -83,7 +110,12 @@ def main(args):
         camera_bp.set_attribute('image_size_x', '640')  # Match training data
         camera_bp.set_attribute('image_size_y', '480')  # Match training data
         camera_bp.set_attribute('fov', '110')
-        camera_transform = carla.Transform(carla.Location(x=2.0, z=1.4))
+
+        camera_transform = carla.Transform(
+            carla.Location(x=1.8, y=0.0, z=1.4),  # Match training position
+            carla.Rotation(pitch=-5.0, yaw=0.0, roll=0.0)  # Match training orientation
+        )
+
         camera_sensor = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
         actor_list.append(camera_sensor)
         print(f"Spawned camera: {camera_sensor.type_id} (id: {camera_sensor.id})")
@@ -181,7 +213,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', default='localhost', help='CARLA server host IP address')
     parser.add_argument('--port', default=2000, type=int, help='CARLA server port')
     parser.add_argument('--duration', default=300, type=int, help='Duration in seconds')
-    parser.add_argument('--target_speed', default=15, type=float, help='Target speed in km/h')
+    parser.add_argument('--target_speed', default=7, type=float, help='Target speed in km/h')
     
     args = parser.parse_args()
     main(args)

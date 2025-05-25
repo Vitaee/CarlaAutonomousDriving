@@ -50,7 +50,8 @@ def main():
 
     train_subset_loader, val_subset_loader = dataset_loader_module.get_data_subsets_loaders(
         dataset_type,
-        batch_size=args.batch_size
+        batch_size=args.batch_size,
+        train_only_center=False
     )
 
     print("Total data size: ", len(train_subset_loader.dataset))

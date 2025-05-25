@@ -62,7 +62,9 @@ class CameraManager(SensorManager):
                  z_offset: float = 1.4,
                  width: int = 640, height: int = 480,
                  fov: float = 90.0,
-                 steer_correction: float = 0.0):
+                 steer_correction: float = 0.0,
+                 yaw: float = 0.0,
+                 pitch: float = -5.0):
         
         super().__init__(world, vehicle, save_path)
         
@@ -75,29 +77,30 @@ class CameraManager(SensorManager):
         self.fov           = fov
         self.steer_correction = steer_correction
 
+        self.yaw         = 0.0
+        self.pitch       = -5.0
+
+
         self.image_folder = save_path / f"images_{camera_name}"
         self.image_folder.mkdir(parents=True, exist_ok=True)
     
     def setup(self):
-        camera_bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
-        camera_bp.set_attribute('image_size_x', str(self.width))
-        camera_bp.set_attribute('image_size_y', str(self.height))
-        camera_bp.set_attribute('fov', str(self.fov))
-        
-        loc = carla.Location(x=self.x_offset,
-                             y=self.y_offset,
-                             z=self.z_offset)
-        
-        # rot = carla.Rotation(pitch=0.0, yaw=0.0, roll=0.0)
+        bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
+        bp.set_attribute('image_size_x', str(self.width))
+        bp.set_attribute('image_size_y', str(self.height))
+        bp.set_attribute('fov',         str(self.fov))
+        #bp.set_attribute('sensor_tick', '0.05')   # 20 Hz logging
 
-        # apply yaw rotation for angled view
-        camera_transform = carla.Transform(
-            loc
-            #rot
-        )
+        loc = carla.Location(x=self.x_offset, y=self.y_offset, z=self.z_offset)
+        rot = carla.Rotation(pitch=self.pitch, yaw=self.yaw, roll=0.0)
+
+        tf  = carla.Transform(loc, rot)
+        self.sensor = self.world.spawn_actor(bp, tf, attach_to=self.vehicle, 
+                                             attachment_type=carla.AttachmentType.Rigid)  # keeps pose fixed
         
-        self.sensor = self.world.spawn_actor(camera_bp, camera_transform, attach_to=self.vehicle)
         self.sensor.listen(lambda image: self._process_image(image))
+
+
         logger.info(f"[{self.camera_name}] @ {loc}")
     
     def _process_image(self, image):
@@ -180,7 +183,7 @@ class DataCollector:
         self.vehicle_manager = None
 
         # Create run directory
-        self.save_path = Path(args.save_dir or 'datasets') / "dataset_carla_001_Town10HD_Opt"
+        self.save_path = Path(args.save_dir) / "dataset_carla_001_Town10HD_Opt"
         self.save_path.mkdir(parents=True, exist_ok=True)
 
         # thread pool for async saving
@@ -227,31 +230,27 @@ class DataCollector:
         logger.info(f'Spawned vehicle at {spawn_point.location}')
 
     def _setup_sensors(self):
-        # define angles and steering corrections
-        # steering correction magnitude
-        corr = self.args.steer_correction
-        #angles = {'center': 0.0, 'left': -20.0, 'right': +20.0}
-
+        corr = 0.20    # radians, ~11°
         cam_configs = {
-            'center': ( 0.0,  0.0),
-            'left':   (-3.25, -corr),   # half-meter left
-            'right':  (+3.25, +corr),   # half-meter right
+            'center': (0.00,   0.0,   0.0),   # y_off,  yaw,  steer_corr
+            'left'  : (-0.45, -20.0, +corr),
+            'right' : (+0.45, +20.0, -corr),
         }
-        
-        for name, (y_off, sc) in cam_configs.items():
-            sc = 0.0 if name == 'center' else (corr if name == 'left' else +corr)
 
+        for name, (y_off, yaw_deg, sc) in cam_configs.items():
             cam = CameraManager(
                 self.world, self.vehicle, self.save_path,
                 camera_name=name,
-                x_offset=2.0,      # same forward mount
-                y_offset=y_off,    # left/right offset
-                z_offset=1.4,      # hood height
-                steer_correction=sc
+                x_offset=1.8,         # 1.5 m in front of CoG ≈ front bumper/hood
+                y_offset=y_off,
+                z_offset=1.4,
+                yaw=yaw_deg,
+                pitch=-5.0,
+                steer_correction=sc,
             )
             cam.setup()
             self.cameras.append(cam)
-
+            
         self.vehicle_manager = VehicleManager(self.vehicle, self.save_path)
 
     def process_sensor_data(self, steering_angle: float):

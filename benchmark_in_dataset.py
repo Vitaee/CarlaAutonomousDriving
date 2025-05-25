@@ -31,7 +31,7 @@ def angel_to_steer(degrees, cols, rows, smoothed_angle):
 
 transform_img = transforms.Compose([
     transforms.ToTensor(),
-    transforms.Resize(config.resize, antialias=True),
+    transforms.Resize((200,66), antialias=True),
     transforms.Normalize(config.mean, config.std)
 ])
 

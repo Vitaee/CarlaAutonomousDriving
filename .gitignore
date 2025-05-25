@@ -11,6 +11,7 @@ dataset_*/
 
 save/
 save_center/
+save_new/
 logs/
 log/
 *.csv
@@ -27,4 +28,6 @@ venv
 
 
 inference_results/
+visualization/
+*.json
 *.log
