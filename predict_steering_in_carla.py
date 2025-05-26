@@ -3,43 +3,13 @@ import cv2
 import numpy as np
 import time
 import argparse
-import math, torch
-from config import config
-from model import NvidiaModel
+import math
+from predict_steering import predict_multiple_outputs
 
 
 # --- Global variable for actor cleanup ---
 actor_list = []
 
-model_class = NvidiaModel
-model = model_class()
-model.load_state_dict(torch.load("./save_new/model.pt", map_location=torch.device(config.device)))
-model.to(config.device)
-model.eval()
-
-def predict_steering_angle(carla_image_bgr):
-    """
-    Process CARLA image to match exact training pipeline
-    """
-    # Convert BGR to YUV (match training)
-    image_yuv = cv2.cvtColor(carla_image_bgr, cv2.COLOR_BGR2YUV)
-    
-    # Resize to exact training dimensions
-    image_resized = cv2.resize(image_yuv, (200, 66))  # Width, Height
-    
-    # Convert to torch tensor with training normalization
-    image = np.transpose(image_resized, (2, 0, 1))
-    image = torch.from_numpy(image).float()
-    image = (image / 127.5) - 1.0  # Match training normalization
-    
-    # Add batch dimension and move to device
-    image = image.unsqueeze(0).to(config.device)
-    
-    # Predict
-    with torch.no_grad():
-        prediction = model(image)
-    
-    return prediction.item()  # Returns angle in radians
 
 def carla_image_to_rgb_array(carla_image):
     """
@@ -64,6 +34,7 @@ def cleanup_actors():
         client.apply_batch([carla.command.DestroyActor(actor) for actor in actor_list])
     print(f"{len(actor_list)} actors destroyed.")
     cv2.destroyAllWindows()
+
 
 def main(args):
     global client
@@ -97,7 +68,7 @@ def main(args):
             return
         
         # spawn_point = spawn_points[10] longest [28] longest 2 [30] longest 3  [49] longesttt 4 [51] longest 5
-        spawn_point = spawn_points[10]
+        spawn_point = spawn_points[6]
         vehicle = world.try_spawn_actor(vehicle_bp, spawn_point)
         if vehicle is None:
             print("Error: Could not spawn vehicle.")
@@ -151,44 +122,66 @@ def main(args):
 
             try:
                 # Get steering prediction using corrected preprocessing
-                predicted_steering = predict_steering_angle(img_rgb)
+                predictions = predict_multiple_outputs(img_rgb)
                 
                 # Clamp steering to valid range
-                predicted_steering = np.clip(predicted_steering, -1.0, 1.0)
-                
+                pred_steering =  np.clip(predictions['steering'], -1.0, 1.0)
+                pred_brake = np.clip(predictions['brake'], 0.0, 1.0)
+
+                raw_throttle = predictions['throttle']
+                pred_throttle = np.clip(raw_throttle, 0.0, 1.0)  # Ensure throttle is between 0 and 1
+                            
             except Exception as e:
                 print(f"Prediction error: {e}")
-                predicted_steering = 0.0  # Default to straight
+                raise e  # Re-raise the exception for visibility
+            
+            #print(f"Predicted steering: {pred_steering:.3f}, throttle: {pred_throttle:.3f}, brake: {pred_brake:.3f}")
 
             # Vehicle Control
             control = carla.VehicleControl()
-            control.steer = float(predicted_steering)
-            
+
+            control.steer = float(pred_steering)  # Use predicted steering
+    
             # Speed control (same as before)
             current_speed_mps = vehicle.get_velocity()
             current_speed_kmh = 3.6 * math.sqrt(current_speed_mps.x**2 + current_speed_mps.y**2 + current_speed_mps.z**2)
             
-            throttle_error = args.target_speed - current_speed_kmh
-            throttle_value = 0.5 * (throttle_error / args.target_speed) if args.target_speed > 0 else 0 
-            throttle_value = np.clip(throttle_value, 0.0, 0.3)
-            
-            if throttle_error < -2:
-                control.brake = 0.2
+            # Check if maximum speed is reached
+            if current_speed_kmh >= args.target_speed:
+                # Override model prediction - force no throttle and possibly brake
                 control.throttle = 0.0
+                control.brake = 0.3 if current_speed_kmh > args.target_speed * 1.05 else 0.0
+                print(f"Maximum speed reached ({current_speed_kmh:.2f} km/h). Overriding throttle.")
             else:
-                control.throttle = throttle_value
-                control.brake = 0.0
-            
+                # Normal speed control logic
+                throttle_error = args.target_speed - current_speed_kmh
+                throttle_value = 0.5 * (throttle_error / args.target_speed) if args.target_speed > 0 else 0 
+                throttle_value = np.clip(throttle_value, 0.1, 0.8)
+
+                # Use model predictions OR speed control, not both
+                if current_speed_kmh < args.target_speed * 0.8:
+                    control.throttle = throttle_value
+                    control.brake = 0.0
+                else:
+                    # Use model predictions when near target speed
+                    control.throttle = max(pred_throttle, 0.2)
+                    control.brake = pred_brake
+
             vehicle.apply_control(control)
+
+         
 
             # Display
             display_img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-            cv2.putText(display_img_bgr, f"Steer: {predicted_steering:.3f}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.putText(display_img_bgr, f"Speed: {current_speed_kmh:.2f} km/h", (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(display_img_bgr, f"Steer: {pred_steering:.3f}", (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(display_img_bgr, f"Throttle: {pred_throttle:.3f}", (10, 60), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(display_img_bgr, f"Brake: {pred_brake:.3f}", (10, 90), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            cv2.putText(display_img_bgr, f"Speed: {current_speed_kmh:.2f} km/h", (10, 120), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
             cv2.imshow("Live Model Test - CARLA", display_img_bgr)
-
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 print("User pressed 'Q'. Exiting...")
@@ -213,7 +206,7 @@ if __name__ == '__main__':
     parser.add_argument('--host', default='localhost', help='CARLA server host IP address')
     parser.add_argument('--port', default=2000, type=int, help='CARLA server port')
     parser.add_argument('--duration', default=300, type=int, help='Duration in seconds')
-    parser.add_argument('--target_speed', default=7, type=float, help='Target speed in km/h')
+    parser.add_argument('--target_speed', default=20, type=float, help='Target speed in km/h')
     
     args = parser.parse_args()
     main(args)

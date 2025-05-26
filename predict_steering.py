@@ -1,15 +1,14 @@
 import torch
-from model import NvidiaModel
+from model import NvidiaMultiOutputModel
 from torchvision import transforms
 from config import config
 import cv2
 import numpy as np
 # Load the model and set it to eval mode
 
-model_class = NvidiaModel
+model_class = NvidiaMultiOutputModel
 model = model_class()
-model.load_state_dict(torch.load("./save/model.pt", map_location=torch.device(config.device)))
-#model.load_state_dict(torch.load("./save_center/model.pt", map_location=torch.device(config.device)))
+model.load_state_dict(torch.load("./save_multioutput/model.pt", map_location=torch.device(config.device)))
 model.to(config.device)
 model.eval()
 
@@ -68,3 +67,32 @@ def predict_steering_angle(image):
         steering_angle = prediction.item()
     
     return steering_angle
+
+
+def predict_multiple_outputs(carla_image_bgr):
+    """
+    Process CARLA image to match exact training pipeline
+    """
+    # Convert BGR to YUV (match training)
+    image_yuv = cv2.cvtColor(carla_image_bgr, cv2.COLOR_BGR2YUV)
+    
+    # Resize to exact training dimensions
+    image_resized = cv2.resize(image_yuv, (200, 66))  # Width, Height
+    
+    # Convert to torch tensor with training normalization
+    image = np.transpose(image_resized, (2, 0, 1))
+    image = torch.from_numpy(image).float()
+    image = (image / 127.5) - 1.0  # Match training normalization
+    
+    # Add batch dimension and move to device
+    image = image.unsqueeze(0).to(config.device)
+    
+    # Predict
+    with torch.no_grad():
+        predictions = model(image)
+    
+    return {
+        'steering': predictions['steering'].item(),
+        'throttle': predictions['throttle'].item(),
+        'brake': predictions['brake'].item()
+    }

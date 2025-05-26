@@ -35,9 +35,9 @@ def convert_opencv_image_to_torch(image):
 
 
 class CarlaSimulatorDataset(Dataset):
-    def __init__(self,
-                 csv_file: str = "steering_data.csv",
-                 root_dir: str = "datasets/dataset_carla_001_Town10HD_Opt",
+    def __init__(self, 
+                 csv_file: str = "steering_data.csv", 
+                 root_dir: str = "datasets/dataset_carla_001_Town10HD_Opt", 
                  train_only_center: bool = True):
         self.dataset_folder = root_dir
         csv_path = os.path.join(self.dataset_folder, csv_file)
@@ -47,59 +47,68 @@ class CarlaSimulatorDataset(Dataset):
         if self.train_only_center:
             self.data = self.data[self.data['camera_position'] == 'center'].reset_index(drop=True)
             print(f"Filtered to center camera only: {len(self.data)} samples")
-        
-
     def __len__(self):
-        return len(self.data) # * 3
+        return len(self.data) 
 
     def __getitem__(self, idx):
         if torch.is_tensor(idx):
             idx = idx.tolist()
 
-        # map idx → row in CSV
         row_idx = idx // 3
         row = self.data.iloc[row_idx]
 
-        # build image path from camera_position
-        filename   = row['frame_filename']
-        camera_pos = row['camera_position'] # 'center', 'left' or 'right'
+        filename = row['frame_filename']
+        camera_pos = row['camera_position']
         
-        img_dir = None 
-
         if self.train_only_center:
-            img_dir   = os.path.join(self.dataset_folder, "images_center")
+            img_dir = os.path.join(self.dataset_folder, "images_center")
         else:
-            img_dir    = os.path.join(self.dataset_folder, f"images_{camera_pos}")
+            img_dir = os.path.join(self.dataset_folder, f"images_{camera_pos}")
 
-
-        img_path   = os.path.join(img_dir, filename)
-
+        img_path = os.path.join(img_dir, filename)
         image = cv2.imread(img_path)
         if image is None:
-            raise FileNotFoundError(f"Could not load image at {img_path}")
+            #raise FileNotFoundError(f"Could not load image at {img_path}")
+            print(f"Warning: Could not load image at {img_path}. Skipping...")
+            # Return a black image as fallback or skip to next valid image
+            if hasattr(self, '_last_valid_image'):
+                image = self._last_valid_image.copy()
+            else:
+                image = np.zeros((480, 640, 3), dtype=np.uint8)  # Default black image
+        else:
+            self._last_valid_image = image.copy()  # Store for fallback
 
-        angle = round(float(row['steering_angle']), 4)
+        # Load all control values
+        steering = round(float(row['steering_angle']), 4)
+        throttle = round(float(row['throttle']), 4)
+        brake = round(float(row['brake']), 4)
 
-        # 0 → none, 1 → brightness, 2 → flip
+        # Apply augmentations
         aug_type = idx % 3
         if aug_type == 1:
             image = add_random_brightness_bgr(image)
         elif aug_type == 2:
             image = cv2.flip(image, 1)
-            angle = -angle
+            steering = -steering  # Only flip steering
 
-        # color-space and resize
+        # Process image
         image = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
         image = cv2.resize(image, (200, 66))
-
         torch_image = convert_opencv_image_to_torch(image)
-        return torch_image, angle
-
+        
+        # Return image and control dict
+        controls = {
+            'steering': steering,
+            'throttle': throttle,
+            'brake': brake
+        }
+        
+        return torch_image, controls
 
 def get_inference_dataset(dataset_type='carla_001', train_only_center=True):
     if dataset_type == 'carla_001':
         return CarlaSimulatorDataset(
-            root_dir="datasets/dataset_carla_001_Town10HD_Opt",
+            root_dir="dataset_multioutput/dataset_carla_001_Town10HD_Opt",
             train_only_center=train_only_center
         )
     else:

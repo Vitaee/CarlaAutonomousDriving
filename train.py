@@ -6,9 +6,9 @@ import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.tensorboard import SummaryWriter
 import dataset_loader as dataset_loader_module
 import argparse
-from model import NvidiaModel
+from model import NvidiaMultiOutputModel
 from config import config
-from utils import EarlyStopping, train, validation, save_model
+from utils import  train, validation, save_model, MultiOutputEarlyStopping
 
 # Carla/Maps/Nav/Town10HD_Opt.bin
 parser = argparse.ArgumentParser(description="Compare loss values from two CSV files.")
@@ -21,7 +21,6 @@ parser.add_argument("--device", type=str, help="GPU device", default=None)
 
 def main():
     args = parser.parse_args()
-
     start_time = time.time()
 
     print(f"Starting Training for:")
@@ -33,19 +32,14 @@ def main():
     print(f"    Optimizer: {config.optimizer}")
     print(f"    Number of workers: {config.num_workers}")
     print(f"    Scheduler: {config.scheduler_type}")
+    
     if args.device is not None:
         config.device = args.device
     
     # Initialize the TensorBoard writer
     writer = SummaryWriter(log_dir=f'./logs/{args.tensorboard_run_name}/')
 
-    dataset_type = [
-        #"udacity_sim_2",
-        "carla_001",
-        #"carla_002",
-        #"carla_003"
-    ]
-
+    dataset_type = ["carla_001"]
     print("Loading datasets: ", dataset_type)
 
     train_subset_loader, val_subset_loader = dataset_loader_module.get_data_subsets_loaders(
@@ -56,10 +50,18 @@ def main():
 
     print("Total data size: ", len(train_subset_loader.dataset))
 
-    # Reset the model, optimizer, and scheduler at the start of each fold
-    model = NvidiaModel()
+    # Load model
+    model = NvidiaMultiOutputModel()
     model.to(config.device)
+    
+    # Define separate loss functions
+    loss_functions = {
+        'steering': nn.MSELoss(),
+        'throttle': nn.MSELoss(),
+        'brake': nn.MSELoss()
+    }
 
+    # Optimizer setup
     if config.optimizer == 'Adam':
         optimizer = optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
     elif config.optimizer == 'SGD':
@@ -69,6 +71,7 @@ def main():
     else:
         raise ValueError(f"Invalid optimizer: {config.optimizer}")
     
+    # Scheduler setup
     if config.scheduler_type == 'step':
         scheduler = lr_scheduler.StepLR(optimizer, step_size=config.scheduler_step_size, gamma=config.scheduler_gamma)
     elif config.scheduler_type == 'multistep':
@@ -77,41 +80,70 @@ def main():
         scheduler = None
     else:
         raise ValueError(f"Invalid scheduler type: {config.scheduler_type}")
-    
-    loss_function = nn.MSELoss()
 
-    # Initialize the early stopping object
-    early_stopping_val = EarlyStopping(patience=config.early_stopping_patience, min_delta=config.early_stopping_min_delta)
-    early_stopping_train = EarlyStopping(patience=config.early_stopping_patience, min_delta=config.early_stopping_min_delta)
+    # Initialize early stopping for multi-output (RECOMMENDED APPROACH)
+    early_stopping_train = MultiOutputEarlyStopping(
+        patience=config.early_stopping_patience, 
+        min_delta=config.early_stopping_min_delta,
+        monitor='total'  # Monitor total loss
+    )
+    early_stopping_val = MultiOutputEarlyStopping(
+        patience=config.early_stopping_patience, 
+        min_delta=config.early_stopping_min_delta,
+        monitor='total'  # Monitor total loss
+    )
+
+    
+    print("Model and optimizer initialized.")
+    print("Starting training...")
 
     # Start epochs
     for epoch in range(1, args.epochs_count + 1):
         header = f"Epoch: {epoch}/{args.epochs_count}"
 
-        # Train the model
-        epoch_train_loss = train(f"{header}, Training", model, train_subset_loader, loss_function, optimizer)
-
-        # Validate the model
-        epoch_validate_loss = validation(f"{header}, Validation", model, val_subset_loader, loss_function)
+        # Train the model      
+        epoch_train_losses = train(f"{header}, Training", model, train_subset_loader, loss_functions, optimizer)
         
-        print(f'{header}, Train Loss: {epoch_train_loss:.9f}')
-        print(f"{header}, Validation Loss: {epoch_validate_loss:.9f}")
+        # Validate
+        epoch_val_losses = validation(f"{header}, Validation", model, val_subset_loader, loss_functions)
         
+        
+        # Print individual losses
+        print(f'{header}, Train - Steering: {epoch_train_losses["steering"]:.6f}, '
+              f'Throttle: {epoch_train_losses["throttle"]:.6f}, '
+              f'Brake: {epoch_train_losses["brake"]:.6f}, '
+              f'Total: {epoch_train_losses["total"]:.6f}')
+        
+        print()
+        print()
+        
+        print(f'{header}, Val - Steering: {epoch_val_losses["steering"]:.6f}, '
+              f'Throttle: {epoch_val_losses["throttle"]:.6f}, '
+              f'Brake: {epoch_val_losses["brake"]:.6f}, '
+              f'Total: {epoch_val_losses["total"]:.6f}')
+        
+        print()
+        
+        # TensorBoard logging
         if config.is_loss_logging_enabled:
-            # Log the train/val loss to TensorBoard
-            writer.add_scalars(f'Loss/Training', {'train': epoch_train_loss, 'val': epoch_validate_loss}, epoch)
+            for control_type in ['steering', 'throttle', 'brake', 'total']:
+                writer.add_scalars(
+                    f'Loss/{control_type}', 
+                    {'train': epoch_train_losses[control_type], 'val': epoch_val_losses[control_type]}, 
+                    epoch
+                )
         
         # Update the learning rate
         if scheduler is not None:
             scheduler.step()
 
-        # early stopping
-        early_stopping_train(epoch_train_loss)
+        # Early stopping - pass the loss dictionaries
+        early_stopping_train(epoch_train_losses)
         if early_stopping_train.early_stop:
             print(f"Early stopping triggered after {config.early_stopping_patience} epochs without improvement in training loss")
             break
         
-        early_stopping_val(epoch_validate_loss)
+        early_stopping_val(epoch_val_losses)
         if early_stopping_val.early_stop:
             print(f"Early stopping triggered after {config.early_stopping_patience} epochs without improvement in validation loss")
             break

@@ -10,12 +10,13 @@ def get_device():
         return "mps"
     else:
         return "cpu"
+    
 
 
 class Config(BaseSettings):
     dataset_type: str = "carla_001"
     batch_size: int = 64
-    num_workers: int = max(os.cpu_count(), 1)
+    num_workers: int = 12 # max(os.cpu_count(), 1)
     shuffle: bool = True
     train_split_size: float = 0.75
     test_split_size: float = 0.25
@@ -50,5 +51,18 @@ class Config(BaseSettings):
     is_learning_rate_logging_enabled: bool = True
     is_grad_avg_logging_enabled: bool = False
 
+    # Multi-output weights
+    steering_weight: float = 1.0
+    throttle_weight: float = 0.5
+    brake_weight: float = 0.5
+    
+    # Output ranges for normalization (if needed)
+    steering_range: tuple = (-1.0, 1.0)
+    throttle_range: tuple = (0.0, 1.0)
+    brake_range: tuple = (0.0, 1.0)
+
+    early_stopping_monitor: str = 'total'  # 'total', 'steering', 'throttle', 'brake', 'weighted_avg'
+    early_stopping_strategy: str = 'multi_criteria'  # 'single', 'multi_criteria', 'consensus'
+    
 
 config = Config()

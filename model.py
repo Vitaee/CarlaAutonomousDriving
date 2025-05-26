@@ -124,3 +124,78 @@ class NvidiaModelTransferLearning(nn.Module):
         x = self.conv_layers(x)
         x = self.flat_layers(x)
         return x.squeeze()
+
+
+class NvidiaMultiOutputModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+        # Shared convolutional layers (same as before)
+        self.conv_layers = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=5, stride=2),
+            nn.BatchNorm2d(24),
+            nn.ReLU(),
+            nn.Conv2d(24, 36, kernel_size=5, stride=2),
+            nn.BatchNorm2d(36),
+            nn.ReLU(),
+            nn.Conv2d(36, 48, kernel_size=5, stride=2),
+            nn.BatchNorm2d(48),
+            nn.ReLU(),
+            nn.Conv2d(48, 64, kernel_size=3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, kernel_size=3),
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+        )
+
+        # Shared fully connected layers
+        self.shared_fc = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=0.5),
+            nn.Linear(1152, 1164),
+            nn.BatchNorm1d(1164),
+            nn.ReLU(),
+            nn.Linear(1164, 100),
+            nn.BatchNorm1d(100),
+            nn.ReLU(),
+            nn.Linear(100, 50),
+            nn.BatchNorm1d(50),
+            nn.ReLU(),
+        )
+
+        # Separate output heads for each control
+        self.steering_head = nn.Sequential(
+            nn.Linear(50, 10),
+            nn.ReLU(),
+            nn.Linear(10, 1),
+            nn.Tanh()  # Steering: [-1, 1]
+        )
+        
+        self.throttle_head = nn.Sequential(
+            nn.Linear(50, 10),
+            nn.ReLU(),
+            nn.Linear(10, 1),
+            nn.Sigmoid()  # Throttle: [0, 1]
+        )
+        
+        self.brake_head = nn.Sequential(
+            nn.Linear(50, 10),
+            nn.ReLU(),
+            nn.Linear(10, 1),
+            nn.Sigmoid()  # Brake: [0, 1]
+        )
+
+    def forward(self, x):
+        x = self.conv_layers(x)
+        x = self.shared_fc(x)
+        
+        steering = self.steering_head(x).squeeze()
+        throttle = self.throttle_head(x).squeeze()
+        brake = self.brake_head(x).squeeze()
+        
+        return {
+            'steering': steering,
+            'throttle': throttle,
+            'brake': brake
+        }

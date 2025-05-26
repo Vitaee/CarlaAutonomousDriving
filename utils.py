@@ -1,15 +1,17 @@
 from torchvision.utils import make_grid
 import torch.nn.functional as F
-import torch
+import torch, cv2
 import dataset_loader
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 import os
 from config import config
 from model import activation
+from PIL import Image
 
 
-def save_model(model, log_dir="./save_center"):
+def save_model(model, log_dir="./save_multioutput"):
     if not config.is_saving_enabled:
         return
     
@@ -24,56 +26,115 @@ def save_model(model, log_dir="./save_center"):
         model.to('cuda')
 
 
-def train(desc_message, model, train_subset_loader, loss_function, optimizer):
+def train(desc_message, model, train_subset_loader, loss_functions, optimizer):
     model.train()
-    batch_loss = np.array([])
+    batch_losses = {
+        'steering': np.array([]),
+        'throttle': np.array([]),
+        'brake': np.array([]),
+        'total': np.array([])
+    }
 
-    for data, target in tqdm(train_subset_loader, desc=desc_message, ascii=' ='):
-
+    for data, targets in tqdm(train_subset_loader, desc=desc_message, ascii=' ='):
         data = data.to(config.device)
-        target = target.to(config.device)
+        
+        # Move targets to device
+        targets_device = {}
+        for key, value in targets.items():
+            targets_device[key] = value.to(config.device)
 
         optimizer.zero_grad()
 
-        y_pred = model(data)
+        # Forward pass
+        predictions = model(data)
         
-        loss = loss_function(y_pred.float(), target.float())
-    
-        loss.backward()
+        # Calculate individual losses
+        steering_loss = loss_functions['steering'](
+            predictions['steering'].float(), 
+            targets_device['steering'].float()
+        )
+        throttle_loss = loss_functions['throttle'](
+            predictions['throttle'].float(), 
+            targets_device['throttle'].float()
+        )
+        brake_loss = loss_functions['brake'](
+            predictions['brake'].float(), 
+            targets_device['brake'].float()
+        )
+        
+        # Weighted total loss
+        total_loss = (
+            config.steering_weight * steering_loss + 
+            config.throttle_weight * throttle_loss + 
+            config.brake_weight * brake_loss
+        )
+
+        total_loss.backward()
         optimizer.step()
 
-        batch_loss = np.append(batch_loss, [loss.item()])
+        # Log losses
+        batch_losses['steering'] = np.append(batch_losses['steering'], steering_loss.item())
+        batch_losses['throttle'] = np.append(batch_losses['throttle'], throttle_loss.item())
+        batch_losses['brake'] = np.append(batch_losses['brake'], brake_loss.item())
+        batch_losses['total'] = np.append(batch_losses['total'], total_loss.item())
 
-        epoch_loss = batch_loss.mean()
-
-    return epoch_loss
+    return {key: losses.mean() for key, losses in batch_losses.items()}
 
 
-def validation(desc_message, model, val_subset_loader, loss_function):
-    # Load model
+def validation(desc_message, model, val_subset_loader, loss_functions):
+    """
+    Validation function for multi-output model
+    """
     model.eval()
-    batch_loss = np.array([])
+    batch_losses = {
+        'steering': np.array([]),
+        'throttle': np.array([]),
+        'brake': np.array([]),
+        'total': np.array([])
+    }
 
     with torch.no_grad():
-        for data_val, target_val in tqdm(val_subset_loader, desc=desc_message, ascii=' ='):
-            # send data to device (its is medatory if GPU has to be used)
+        for data_val, targets_val in tqdm(val_subset_loader, desc=desc_message, ascii=' ='):
+            # Send data to device
             data_val = data_val.to(config.device)
-
-            # send target to device
-            target_val = target_val.to(config.device)
             
-            # forward pass to the model
-            y_pred_val = model(data_val)
+            # Move targets to device
+            targets_val_device = {}
+            for key, value in targets_val.items():
+                targets_val_device[key] = value.to(config.device)
 
-            # cross entropy loss
-            loss = loss_function(y_pred_val.float(), target_val.float())
+            # Forward pass
+            predictions_val = model(data_val)
+            
+            # Calculate individual losses
+            steering_loss = loss_functions['steering'](
+                predictions_val['steering'].float(), 
+                targets_val_device['steering'].float()
+            )
+            throttle_loss = loss_functions['throttle'](
+                predictions_val['throttle'].float(), 
+                targets_val_device['throttle'].float()
+            )
+            brake_loss = loss_functions['brake'](
+                predictions_val['brake'].float(), 
+                targets_val_device['brake'].float()
+            )
+            
+            # Weighted total loss (same as training)
+            total_loss = (
+                config.steering_weight * steering_loss + 
+                config.throttle_weight * throttle_loss + 
+                config.brake_weight * brake_loss
+            )
 
-            # Capture log
-            batch_loss = np.append(batch_loss, [loss.item()])
+            # Log losses
+            batch_losses['steering'] = np.append(batch_losses['steering'], steering_loss.item())
+            batch_losses['throttle'] = np.append(batch_losses['throttle'], throttle_loss.item())
+            batch_losses['brake'] = np.append(batch_losses['brake'], brake_loss.item())
+            batch_losses['total'] = np.append(batch_losses['total'], total_loss.item())
                 
-    epoch_loss = batch_loss.mean()
-
-    return epoch_loss
+    # Return mean losses for each output
+    return {key: losses.mean() for key, losses in batch_losses.items()}
 
 
 def add_grad_average_to_tensorboard(writer, model, train_subset_loader, epoch, fold):
@@ -164,3 +225,113 @@ class EarlyStopping:
         else:
             self.best_score = score
             self.counter = 0
+
+
+
+class MultiOutputEarlyStopping:
+    def __init__(self, patience=5, min_delta=0, monitor='total'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.monitor = monitor  # 'total', 'steering', 'throttle', 'brake', or 'weighted_avg'
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+
+    def __call__(self, loss_dict):
+        # Select which loss to monitor
+        if self.monitor == 'total':
+            val_loss = loss_dict['total']
+        elif self.monitor == 'weighted_avg':
+            # Custom weighted average
+            val_loss = (
+                config.steering_weight * loss_dict['steering'] +
+                config.throttle_weight * loss_dict['throttle'] +
+                config.brake_weight * loss_dict['brake']
+            ) / (config.steering_weight + config.throttle_weight + config.brake_weight)
+        else:
+            val_loss = loss_dict[self.monitor]
+        
+        score = -val_loss
+
+        if self.best_score is None:
+            self.best_score = score
+        elif score < self.best_score + self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.counter = 0
+
+
+
+
+def find_corrupted_images(dataset_path):
+    csv_path = os.path.join(dataset_path, "steering_data.csv")
+    data = pd.read_csv(csv_path)
+    
+    corrupted_files = []
+    valid_indices = []
+    
+    for idx, row in data.iterrows():
+        filename = row['frame_filename']
+        camera_pos = row['camera_position']
+        img_dir = os.path.join(dataset_path, f"images_{camera_pos}")
+        img_path = os.path.join(img_dir, filename)
+        
+        is_valid = True
+        
+        # Check if file exists
+        if not os.path.exists(img_path):
+            corrupted_files.append((idx, img_path, "Missing file"))
+            is_valid = False
+        else:
+            # Test with OpenCV
+            try:
+                image = cv2.imread(img_path)
+                if image is None:
+                    corrupted_files.append((idx, img_path, "OpenCV failed"))
+                    is_valid = False
+            except Exception as e:
+                corrupted_files.append((idx, img_path, f"OpenCV error: {e}"))
+                is_valid = False
+            
+            # Test with PIL for PNG-specific errors
+            if is_valid:
+                try:
+                    with Image.open(img_path) as img:
+                        img.verify()  # Verify PNG integrity
+                except Exception as e:
+                    corrupted_files.append((idx, img_path, f"PIL error: {e}"))
+                    is_valid = False
+        
+        if is_valid:
+            valid_indices.append(idx)
+    
+    return corrupted_files, valid_indices
+
+
+def create_clean_dataset(dataset_path, valid_indices):
+    csv_path = os.path.join(dataset_path, "steering_data.csv")
+    data = pd.read_csv(csv_path)
+    
+    # Keep only valid indices
+    clean_data = data.iloc[valid_indices].reset_index(drop=True)
+    
+    # Save clean CSV
+    clean_csv_path = os.path.join(dataset_path, "steering_data_clean.csv")
+    clean_data.to_csv(clean_csv_path, index=False)
+    
+    print(f"Original dataset: {len(data)} samples")
+    print(f"Clean dataset: {len(clean_data)} samples")
+    print(f"Removed: {len(data) - len(clean_data)} corrupted samples")
+    print(f"Clean CSV saved to: {clean_csv_path}")
+
+# Run the check
+#dataset_path = "dataset_multioutput/dataset_carla_001_Town10HD_Opt"
+#corrupted, valid_indices = find_corrupted_images(dataset_path)
+
+#print(f"Found {len(corrupted)} corrupted files out of total")
+#print(f"Valid samples: {len(valid_indices)}")
+
+#create_clean_dataset(dataset_path, valid_indices)

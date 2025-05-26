@@ -44,7 +44,7 @@ class SensorManager:
     def setup(self):
         raise NotImplementedError
     
-    def save_data(self, data, steering_angle, csv_writer, csv_file, csv_lock):
+    def save_data(self, data, control_data, csv_writer, csv_file, csv_lock):
         raise NotImplementedError
     
     def destroy(self):
@@ -110,16 +110,24 @@ class CameraManager(SensorManager):
         cam_data = CameraData(frame=image.frame, timestamp=image.timestamp, image=array)
         self.data_queue.put(cam_data)
     
-    def save_data(self, data: CameraData, steering_angle, csv_writer, csv_file, csv_lock):
+    def save_data(self, data: CameraData, control_data, csv_writer, csv_file, csv_lock):
         filename = f"{self.camera_name}_{data.frame:06d}.png"
         img_path = self.image_folder / filename
         cv2.imwrite(str(img_path), cv2.cvtColor(data.image, cv2.COLOR_RGB2BGR))
         
         # adjust steering for side cameras
-        steering_adj = steering_angle + self.steer_correction
+        steering_adj = control_data.steering  + self.steer_correction
         
         with csv_lock:
-            csv_writer.writerow([filename, steering_adj, self.camera_name])
+            #csv_writer.writerow([filename, steering_adj, self.camera_name])
+            csv_writer.writerow([
+                filename,
+                steering_adj,
+                control_data.throttle,  # NEW
+                control_data.brake,  
+                self.camera_name
+            ])
+
             csv_file.flush()
         return img_path
 
@@ -168,7 +176,7 @@ class VehicleManager:
             gear=control.gear,
             turn_direction=turn
         )
-        self.save_control_data(vc)
+        #self.save_control_data(vc)
         return vc
 
 
@@ -196,7 +204,13 @@ class DataCollector:
         # open annotations CSV
         self.csv_file = open(self.save_path / 'steering_data.csv', 'w', newline='')
         self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(['frame_filename', 'steering_angle', 'camera_position'])
+        self.csv_writer.writerow([
+            'frame_filename', 
+            'steering_angle', 
+            'throttle',      # NEW
+            'brake',         # NEW
+            'camera_position'
+        ])
         self._csv_lock = threading.Lock()
 
     def setup(self):
@@ -253,14 +267,14 @@ class DataCollector:
             
         self.vehicle_manager = VehicleManager(self.vehicle, self.save_path)
 
-    def process_sensor_data(self, steering_angle: float):
+    def process_sensor_data(self, control_data: VehicleControlData):
         for cam in self.cameras:
             while not cam.data_queue.empty():
                 data = cam.data_queue.get()
                 self.executor.submit(
                     cam.save_data,
                     data,
-                    steering_angle,
+                    control_data,
                     self.csv_writer,
                     self.csv_file,
                     self._csv_lock
@@ -274,7 +288,7 @@ class DataCollector:
 
         timestamp = time.time()
         control_data = self.vehicle_manager.collect_control_data(self.frame_count, timestamp)
-        self.process_sensor_data(control_data.steering)
+        self.process_sensor_data(control_data)
         self.frame_count += 1
 
     def run(self):
@@ -319,9 +333,9 @@ def parse_arguments():
     parser.add_argument('--port', default=2000, type=int, help='CARLA server port')
     parser.add_argument('--timeout', default=5.0, type=float, help='CARLA client timeout')
     parser.add_argument('--sync', action='store_true', help='Enable synchronous mode')
-    parser.add_argument('--save-dir', default='./dataset_new', help='Directory to save collected data')
-    # 11.000 : 33.180 frame,  22000 
-    parser.add_argument('--max-frames', default=500, type=int, help='Maximum number of frames to collect (-1 for unlimited)')
+    parser.add_argument('--save-dir', default='./dataset_multioutput', help='Directory to save collected data')
+    # 11.000 : 33.180 frame,  22000: 75.324,  26000: 82.956, 28000:  90.282
+    parser.add_argument('--max-frames', default=28000, type=int, help='Maximum number of frames to collect (-1 for unlimited)')
     parser.add_argument('--steer-correction', type=float, default=0.2,
                         help='Steering adjustment for left/right camera views')
     return parser.parse_args()
