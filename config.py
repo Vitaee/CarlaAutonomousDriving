@@ -1,54 +1,32 @@
 import torch
 import os
-from pydantic import BaseSettings
+from dataclasses import dataclass
 
 
-def get_device():
-    if torch.cuda.is_available():
-        return "cuda"
-    elif torch.backends.mps.is_available():
-        return "mps"
-    else:
-        return "cpu"
-
-
-class Config(BaseSettings):
+@dataclass
+class Config:
+    # Dataset settings
     dataset_type: str = "carla_001"
-    batch_size: int = 64
-    num_workers: int = max(os.cpu_count(), 1)
-    shuffle: bool = True
-    train_split_size: float = 0.75
-    test_split_size: float = 0.25
-    resize: tuple = (66, 200)
-    epochs_count: int = 45
-    optimizer: str = "Adam"
+    train_split_size: float = 0.8
+    test_split_size: float = 0.2
+    
+    # Training settings
+    batch_size: int = 128
+    epochs_count: int = 50
     learning_rate: float = 1e-3
     weight_decay: float = 1e-5
-    momentum: float = 0.9
-    save_model: bool = True
-    root_path: str = "./"
-    model_path: str = "model.pt"
-    optimizer_path: str = "optimizer.pt"
-    loss_path: str = "loss.pt"
-    device: str = get_device()
-    mean: list = [0.485, 0.456, 0.406]
-    std: list = [0.229, 0.224, 0.225]
-    epsilon: float = 0.001
+    
+    # Early stopping
     early_stopping_patience: int = 10
-    early_stopping_min_delta: float = 0.0005
-
-    cross_validation_folds: int = 4
+    early_stopping_min_delta: float = 0.0001
     
-    scheduler_type: str = "multistep"
-    scheduler_multistep_milestones: list = [8, 12, 16, 20, 24]
-    scheduler_step_size: int = 35
-    scheduler_gamma: float = 0.5
+    # System settings
+    num_workers: int = min(12, os.cpu_count())
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
-    is_saving_enabled: bool = True
-    is_loss_logging_enabled: bool = True
-    is_image_logging_enabled: bool = False
-    is_learning_rate_logging_enabled: bool = True
-    is_grad_avg_logging_enabled: bool = False
+    # Paths
+    save_dir: str = "checkpoints"
+    log_dir: str = "logs"
 
 
 config = Config()

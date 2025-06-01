@@ -212,3 +212,12 @@ For issues and questions:
 1. Check the troubleshooting section
 2. Review existing GitHub issues
 3. Create a new issue with detailed description
+
+### Train with all cameras using all datasets
+- python improved_train.py --batch_size 128 --epochs 50 --use_all_cameras
+
+### Train with center camera only
+- python improved_train.py --batch_size 64 --epochs 30 --use_all_cameras
+
+### Custom learning rate and run name
+- python improved_train.py --lr 0.0005 --run_name "carla_final_model"

@@ -1,131 +1,282 @@
-
 import time
+import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.optim.lr_scheduler as lr_scheduler
 from torch.utils.tensorboard import SummaryWriter
-import dataset_loader as dataset_loader_module
+from torch.utils.data import DataLoader, ConcatDataset
 import argparse
-from model import NvidiaModel
-from config import config
-from utils import EarlyStopping, train, validation, save_model
+from pathlib import Path
+from tqdm import tqdm
+import numpy as np
 
-# Carla/Maps/Nav/Town10HD_Opt.bin
-parser = argparse.ArgumentParser(description="Compare loss values from two CSV files.")
-parser.add_argument("--dataset_type", type=str, help="Dataset type", choices=['sully', 'udacity', 'udacity_sim_1', 'udacity_sim_2'], default='sully')
-parser.add_argument("--batch_size", type=int, help="Batch size", default=config.batch_size)
-parser.add_argument("--epochs_count", type=int, help="Epochs count", default=config.epochs_count)
-parser.add_argument("--tensorboard_run_name", type=str, help="Tensorboard run name", default='tensorboard')
-parser.add_argument("--device", type=str, help="GPU device", default=None)
+from model import NvidiaModelTransferLearning
+from dataset_loader import CarlaDataset
+from config import config
+
+
+class Trainer:
+    def __init__(self, model, train_loader, val_loader, device):
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.device = device
+        
+        # Loss and optimizer
+        self.criterion = nn.MSELoss()
+        self.optimizer = optim.Adam(
+            model.parameters(), 
+            lr=config.learning_rate, 
+            weight_decay=config.weight_decay
+        )
+        
+        # Learning rate scheduler
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer, mode='min', patience=5, factor=0.5
+        )
+        
+        # Early stopping
+        self.best_val_loss = float('inf')
+        self.patience_counter = 0
+        self.patience = config.early_stopping_patience
+        
+    def train_epoch(self):
+        self.model.train()
+        total_loss = 0.0
+        
+        with tqdm(self.train_loader, desc="Training", leave=False) as pbar:
+            for batch_idx, (images, targets) in enumerate(pbar):
+                images = images.to(self.device, non_blocking=True)
+                targets = targets.to(self.device, non_blocking=True)
+                
+                # Forward pass
+                self.optimizer.zero_grad()
+                outputs = self.model(images)
+                loss = self.criterion(outputs, targets)
+                
+                # Backward pass
+                loss.backward()
+                self.optimizer.step()
+                
+                total_loss += loss.item()
+                pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+        
+        return total_loss / len(self.train_loader)
+    
+    def validate_epoch(self):
+        self.model.eval()
+        total_loss = 0.0
+        
+        with torch.no_grad():
+            with tqdm(self.val_loader, desc="Validation", leave=False) as pbar:
+                for images, targets in pbar:
+                    images = images.to(self.device, non_blocking=True)
+                    targets = targets.to(self.device, non_blocking=True)
+                    
+                    outputs = self.model(images)
+                    loss = self.criterion(outputs, targets)
+                    
+                    total_loss += loss.item()
+                    pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+        
+        return total_loss / len(self.val_loader)
+    
+    def save_checkpoint(self, epoch, val_loss, filepath):
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'val_loss': val_loss,
+        }
+        torch.save(checkpoint, filepath)
+    
+    def early_stop_check(self, val_loss):
+        if val_loss < self.best_val_loss:
+            self.best_val_loss = val_loss
+            self.patience_counter = 0
+            return False
+        else:
+            self.patience_counter += 1
+            return self.patience_counter >= self.patience
+
+
+def create_data_loaders(batch_size=64, num_workers=8, use_all_cameras=True):
+    """Create train and validation data loaders from all CARLA datasets"""
+    
+    datasets_path = Path("datasets")
+    town_folders = [
+        "dataset_carla_001_Town01",
+        "dataset_carla_001_Town02", 
+        "dataset_carla_001_Town03",
+        "dataset_carla_001_Town04",
+        #"dataset_carla_001_Town05",
+        #"dataset_carla_001_Town10HD_Opt"
+    ]
+    
+    all_datasets = []
+    
+    for town_folder in town_folders:
+        town_path = datasets_path / town_folder
+        if town_path.exists():
+            print(f"Loading dataset: {town_folder}")
+            dataset = CarlaDataset(
+                root_dir=str(town_path),
+                use_all_cameras=use_all_cameras
+            )
+            all_datasets.append(dataset)
+            print(f"  Loaded {len(dataset)} samples")
+        else:
+            print(f"Warning: {town_folder} not found")
+    
+    if not all_datasets:
+        raise ValueError("No datasets found!")
+    
+    # Combine all datasets
+    combined_dataset = ConcatDataset(all_datasets)
+    print(f"Total combined samples: {len(combined_dataset)}")
+    
+    # Split into train/val
+    train_size = int(config.train_split_size * len(combined_dataset))
+    val_size = len(combined_dataset) - train_size
+    
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        combined_dataset, [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)  # For reproducibility
+    )
+    
+    print(f"Train samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    # Create data loaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False
+    )
+    
+    return train_loader, val_loader
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Train CARLA Steering Model")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
+    parser.add_argument("--use_all_cameras", action="store_true", default=True, 
+                       help="Use all three cameras (center, left, right)")
+    parser.add_argument("--run_name", type=str, default="carla_steering", 
+                       help="Run name for tensorboard")
+    parser.add_argument("--num_workers", type=int, default=8, help="Number of data loader workers")
+    
     args = parser.parse_args()
-
-    start_time = time.time()
-
-    print(f"Starting Training for:")
-    print(f"    TensorBoard Run Name: {args.tensorboard_run_name}")
-    print(f"    Number of Epochs: {args.epochs_count}")
-    print(f"    Batch Size: {config.batch_size}")
-    print(f"    Learning Rate: {config.learning_rate}")
-    print(f"    Weight Decay: {config.weight_decay}")
-    print(f"    Optimizer: {config.optimizer}")
-    print(f"    Number of workers: {config.num_workers}")
-    print(f"    Scheduler: {config.scheduler_type}")
-    if args.device is not None:
-        config.device = args.device
     
-    # Initialize the TensorBoard writer
-    writer = SummaryWriter(log_dir=f'./logs/{args.tensorboard_run_name}/')
-
-    dataset_type = [
-        #"udacity_sim_2",
-        "carla_001",
-        #"carla_002",
-        #"carla_003"
-    ]
-
-    print("Loading datasets: ", dataset_type)
-
-    train_subset_loader, val_subset_loader = dataset_loader_module.get_data_subsets_loaders(
-        dataset_type,
+    # Update config
+    config.learning_rate = args.lr
+    
+    # Setup device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create data loaders
+    print("Creating data loaders...")
+    train_loader, val_loader = create_data_loaders(
         batch_size=args.batch_size,
-        train_only_center=False
+        num_workers=args.num_workers,
+        use_all_cameras=args.use_all_cameras
     )
-
-    print("Total data size: ", len(train_subset_loader.dataset))
-
-    # Reset the model, optimizer, and scheduler at the start of each fold
-    model = NvidiaModel()
-    model.to(config.device)
-
-    if config.optimizer == 'Adam':
-        optimizer = optim.Adam(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    elif config.optimizer == 'SGD':
-        optimizer = optim.SGD(model.parameters(), lr=config.learning_rate, momentum=config.momentum, weight_decay=config.weight_decay)
-    elif config.optimizer == 'AdamW':
-        optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay)
-    else:
-        raise ValueError(f"Invalid optimizer: {config.optimizer}")
     
-    if config.scheduler_type == 'step':
-        scheduler = lr_scheduler.StepLR(optimizer, step_size=config.scheduler_step_size, gamma=config.scheduler_gamma)
-    elif config.scheduler_type == 'multistep':
-        scheduler = lr_scheduler.MultiStepLR(optimizer, milestones=config.scheduler_multistep_milestones, gamma=config.scheduler_gamma)
-    elif config.scheduler_type == 'nonscheduler':
-        scheduler = None
-    else:
-        raise ValueError(f"Invalid scheduler type: {config.scheduler_type}")
+    # Create model
+    print("Creating model...")
+    model = NvidiaModelTransferLearning()
     
-    loss_function = nn.MSELoss()
+    # Print model info
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
+    # Create trainer
+    trainer = Trainer(model, train_loader, val_loader, device)
+    
+    # Setup tensorboard
+    writer = SummaryWriter(f'logs/{args.run_name}')
+    
+    # Create save directory
+    save_dir = Path("checkpoints")
+    save_dir.mkdir(exist_ok=True)
+    
+    print(f"\nStarting training...")
+    print(f"Epochs: {args.epochs}")
+    print(f"Batch size: {args.batch_size}")
+    print(f"Learning rate: {args.lr}")
+    print(f"Use all cameras: {args.use_all_cameras}")
+    
+    start_time = time.time()
+    epoch = 0
+    val_loss = float('inf')
 
-    # Initialize the early stopping object
-    early_stopping_val = EarlyStopping(patience=config.early_stopping_patience, min_delta=config.early_stopping_min_delta)
-    early_stopping_train = EarlyStopping(patience=config.early_stopping_patience, min_delta=config.early_stopping_min_delta)
-
-    # Start epochs
-    for epoch in range(1, args.epochs_count + 1):
-        header = f"Epoch: {epoch}/{args.epochs_count}"
-
-        # Train the model
-        epoch_train_loss = train(f"{header}, Training", model, train_subset_loader, loss_function, optimizer)
-
-        # Validate the model
-        epoch_validate_loss = validation(f"{header}, Validation", model, val_subset_loader, loss_function)
+    for epoch in range(1, args.epochs + 1):
+        print(f"\nEpoch {epoch}/{args.epochs}")
         
-        print(f'{header}, Train Loss: {epoch_train_loss:.9f}')
-        print(f"{header}, Validation Loss: {epoch_validate_loss:.9f}")
+        # Train
+        train_loss = trainer.train_epoch()
         
-        if config.is_loss_logging_enabled:
-            # Log the train/val loss to TensorBoard
-            writer.add_scalars(f'Loss/Training', {'train': epoch_train_loss, 'val': epoch_validate_loss}, epoch)
+        # Validate
+        val_loss = trainer.validate_epoch()
         
-        # Update the learning rate
-        if scheduler is not None:
-            scheduler.step()
-
-        # early stopping
-        early_stopping_train(epoch_train_loss)
-        if early_stopping_train.early_stop:
-            print(f"Early stopping triggered after {config.early_stopping_patience} epochs without improvement in training loss")
+        # Update scheduler
+        trainer.scheduler.step(val_loss)
+        
+        # Log to tensorboard
+        writer.add_scalars('Loss', {
+            'train': train_loss,
+            'val': val_loss
+        }, epoch)
+        
+        writer.add_scalar('Learning_Rate', 
+                         trainer.optimizer.param_groups[0]['lr'], epoch)
+        
+        print(f"Train Loss: {train_loss:.6f}")
+        print(f"Val Loss: {val_loss:.6f}")
+        print(f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
+        
+        # Save best model
+        if val_loss < trainer.best_val_loss:
+            best_model_path = save_dir / f"{args.run_name}_best.pt"
+            trainer.save_checkpoint(epoch, val_loss, best_model_path)
+            print(f"New best model saved: {val_loss:.6f}")
+        
+        # Save checkpoint every 10 epochs
+        if epoch % 10 == 0:
+            checkpoint_path = save_dir / f"{args.run_name}_epoch_{epoch}.pt"
+            trainer.save_checkpoint(epoch, val_loss, checkpoint_path)
+        
+        # Early stopping check
+        if trainer.early_stop_check(val_loss):
+            print(f"Early stopping triggered after {epoch} epochs")
             break
-        
-        early_stopping_val(epoch_validate_loss)
-        if early_stopping_val.early_stop:
-            print(f"Early stopping triggered after {config.early_stopping_patience} epochs without improvement in validation loss")
-            break
-
-    # Save the final model
-    save_model(model)
-
-    # Close the TensorBoard writer
+    
+    # Save final model
+    final_model_path = save_dir / f"{args.run_name}_final.pt"
+    trainer.save_checkpoint(epoch, val_loss, final_model_path)
+    
     writer.close()
-
-    end_time = time.time()
-    elapsed_time = end_time - start_time
-    print(f"Training took {elapsed_time:.2f} seconds")
-    print("Training finished")
+    
+    elapsed_time = time.time() - start_time
+    print(f"\nTraining completed in {elapsed_time:.2f} seconds")
+    print(f"Best validation loss: {trainer.best_val_loss:.6f}")
 
 
 if __name__ == '__main__':

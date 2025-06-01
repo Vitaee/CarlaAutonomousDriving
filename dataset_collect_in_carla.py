@@ -18,6 +18,9 @@ class CarlaDataCollector:
         self.frame_counter = 0
         self.data_queue = queue.Queue()
         self.lock = threading.Lock()
+
+        self.client = carla.Client(self.host, self.port)
+        self.client.set_timeout(20.0)
         
         self.map = map
         #  'Town02', 'Town03', 'Town04', 'Town05', 'Town10HD_Opt'
@@ -27,10 +30,10 @@ class CarlaDataCollector:
         self.camera_height = 480
         self.camera_fov = 90
         
-    def setup_world(self, client, town_name):
+    def setup_world(self, town_name):
         """Setup the world with the specified town"""
         try:
-            world = client.load_world(town_name)
+            world = self.client.load_world(town_name)
             time.sleep(3)
             
             # Set weather to sunny clear sky
@@ -60,7 +63,7 @@ class CarlaDataCollector:
             print(f"Error setting up world {town_name}: {e}")
             return None
     
-    def setup_vehicle_and_cameras(self, world, client):
+    def setup_vehicle_and_cameras(self, world):
         """Setup vehicle and cameras"""
         try:
             # Get a random spawn point
@@ -80,29 +83,29 @@ class CarlaDataCollector:
             time.sleep(4.0)
             
             # Enable autopilot with traffic manager settings
-            traffic_manager = client.get_trafficmanager()
+            traffic_manager = self.client.get_trafficmanager()
             
-            time.sleep(4.0)
+            time.sleep(5.0)
             # ignore %80 of traffic lights
             traffic_manager.ignore_lights_percentage(vehicle, 80)
             
             traffic_manager.set_synchronous_mode(True)
 
-            time.sleep(2.0)
+            time.sleep(4.0)
             
             # Configure traffic manager for better driving
             traffic_manager.set_global_distance_to_leading_vehicle(2.0)
-            traffic_manager.set_hybrid_physics_mode(True)
+            #traffic_manager.set_hybrid_physics_mode(True)
             
 
             time.sleep(2.0)
-            traffic_manager.global_percentage_speed_difference(-10.0)  # Drive 10% faster
+            traffic_manager.global_percentage_speed_difference(10.0)  # Drive 10% faster
 
             time.sleep(2.0)
 
             # Set vehicle to autopilot
             vehicle.set_autopilot(True, traffic_manager.get_port())
-            
+            time.sleep(2.0)
 
             # Camera blueprint
             camera_bp = blueprint_library.find('sensor.camera.rgb')
@@ -143,7 +146,11 @@ class CarlaDataCollector:
         try:
             # Get vehicle control
             control = vehicle.get_control()
+            time.sleep(0.2)
+            
             velocity = vehicle.get_velocity()
+            time.sleep(0.2)
+
             speed_kmh = 3.6 * np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
             
             # Create directories
@@ -199,19 +206,15 @@ class CarlaDataCollector:
         csv_data_buffer = []
         
         try:
-            # Connect to CARLA
-            client = carla.Client(self.host, self.port + thread_id)  # Use different ports for threads
-            time.sleep(3.0)
-            client.set_timeout(15.0)
             
             # Setup world
-            world = self.setup_world(client, town_name)
+            world = self.setup_world(town_name)
             time.sleep(3.0)
             if world is None:
                 return
             
             # Setup vehicle and cameras
-            vehicle, cameras = self.setup_vehicle_and_cameras(world, client)
+            vehicle, cameras = self.setup_vehicle_and_cameras(world)
             if vehicle is None or cameras is None:
                 return
             
@@ -334,7 +337,7 @@ class CarlaDataCollector:
 
 def main():
     # Configuration
-    MAX_FRAMES = 19000  # Adjust as needed
+    MAX_FRAMES = 400  # Adjust as needed
     HOST = 'localhost'
     BASE_PORT = 2000
     
@@ -348,7 +351,7 @@ def main():
     
    
     # Create collector
-    collector = CarlaDataCollector(host=HOST, port=BASE_PORT, max_frames=MAX_FRAMES, map='Town03')
+    collector = CarlaDataCollector(host=HOST, port=BASE_PORT, max_frames=MAX_FRAMES, map='Town04')
 
     time.sleep(4.0)
 

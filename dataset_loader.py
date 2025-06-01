@@ -1,144 +1,84 @@
-from typing import Tuple
-from torch.utils.data import Dataset, DataLoader, ConcatDataset, random_split
-from config import config
+import torch
+from torch.utils.data import Dataset
 import pandas as pd
+import cv2
 import numpy as np
 import os
-import torch
-import cv2
+from pathlib import Path
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 
-def add_random_shadow_bgr(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    intensity = 0.4
-    x1, x2 = np.random.randint(0, img.shape[1], size=2)
-    if x1 > x2:
-        x1, x2 = x2, x1
-    hsv[:, x1:x2, 2] = hsv[:, x1:x2, 2] * intensity
-    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-
-def add_random_brightness_bgr(img):
-    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    offset = np.random.randint(-50, 50)
-    hsv[:, :, 2] = np.clip(hsv[:, :, 2] + offset, 0, 255)
-    return cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-
-
-def convert_opencv_image_to_torch(image):
-    
-    image = np.transpose(image, (2, 0, 1))
-    image = torch.from_numpy(image).float()
-    image = (image / 127.5) - 1.0
-
-    return image
-
-
-class CarlaSimulatorDataset(Dataset):
-    def __init__(self,
-                 csv_file: str = "steering_data.csv",
-                 root_dir: str = "datasets/dataset_carla_001_Town10HD_Opt",
-                 train_only_center: bool = True):
-        self.dataset_folder = root_dir
-        csv_path = os.path.join(self.dataset_folder, csv_file)
+class CarlaDataset(Dataset):
+    def __init__(self, root_dir, csv_file="steering_data.csv", use_all_cameras=True):
+        self.root_dir = Path(root_dir)
+        self.use_all_cameras = use_all_cameras
+        
+        # Load CSV data
+        csv_path = self.root_dir / csv_file
         self.data = pd.read_csv(csv_path)
-        self.train_only_center = train_only_center
-
-        if self.train_only_center:
+        
+        # Filter data if needed
+        if not use_all_cameras:
             self.data = self.data[self.data['camera_position'] == 'center'].reset_index(drop=True)
-            print(f"Filtered to center camera only: {len(self.data)} samples")
         
-
+        # Image directories
+        self.image_dirs = {
+            'center': self.root_dir / 'images_center',
+            'left': self.root_dir / 'images_left', 
+            'right': self.root_dir / 'images_right'
+        }
+        
+        # Data augmentation pipeline
+        self.transform = A.Compose([
+            A.Resize(66, 200),  # Nvidia model input size
+            A.OneOf([
+                A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
+                A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.5),
+                A.RandomGamma(gamma_limit=(80, 120), p=0.3),
+            ], p=0.3),
+            A.HorizontalFlip(p=0.5),  # We'll handle steering angle adjustment manually
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ]) # type: ignore
+        
+        self.transform_val = A.Compose([
+            A.Resize(66, 200),
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+        
+        print(f"Loaded {len(self.data)} samples from {root_dir}")
+    
     def __len__(self):
-        return len(self.data) # * 3
-
+        return len(self.data)
+    
     def __getitem__(self, idx):
-        if torch.is_tensor(idx):
-            idx = idx.tolist()
-
-        # map idx → row in CSV
-        row_idx = idx // 3
-        row = self.data.iloc[row_idx]
-
-        # build image path from camera_position
-        filename   = row['frame_filename']
-        camera_pos = row['camera_position'] # 'center', 'left' or 'right'
+        row = self.data.iloc[idx]
         
-        img_dir = None 
-
-        if self.train_only_center:
-            img_dir   = os.path.join(self.dataset_folder, "images_center")
-        else:
-            img_dir    = os.path.join(self.dataset_folder, f"images_{camera_pos}")
-
-
-        img_path   = os.path.join(img_dir, filename)
-
-        image = cv2.imread(img_path)
+        # Get image path
+        camera_pos = row['camera_position']
+        filename = row['frame_filename']
+        image_path = self.image_dirs[camera_pos] / filename
+        
+        # Load image
+        image = cv2.imread(str(image_path))
         if image is None:
-            raise FileNotFoundError(f"Could not load image at {img_path}")
-
-        angle = round(float(row['steering_angle']), 4)
-
-        # 0 → none, 1 → brightness, 2 → flip
-        aug_type = idx % 3
-        if aug_type == 1:
-            image = add_random_brightness_bgr(image)
-        elif aug_type == 2:
-            image = cv2.flip(image, 1)
-            angle = -angle
-
-        # color-space and resize
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2YUV)
-        image = cv2.resize(image, (200, 66))
-
-        torch_image = convert_opencv_image_to_torch(image)
-        return torch_image, angle
-
-
-def get_inference_dataset(dataset_type='carla_001', train_only_center=True):
-    if dataset_type == 'carla_001':
-        return CarlaSimulatorDataset(
-            root_dir="datasets/dataset_carla_001_Town10HD_Opt",
-            train_only_center=train_only_center
-        )
-    else:
-        raise ValueError(f"Invalid dataset type: {dataset_type}")
-
-
-def get_datasets(dataset_types=['carla_001']) -> Dataset:
-    datasets_list = []
-    for dt in dataset_types:
-        datasets_list.append(get_inference_dataset(dt))
-    return ConcatDataset(datasets_list)
-
-
-def get_data_subsets_loaders(dataset_types=['carla_001'],
-                             batch_size=config.batch_size,
-                                train_only_center=True
-                             ) -> Tuple[DataLoader, DataLoader]:
-    
-    loaded = [get_inference_dataset(dt, train_only_center) for dt in dataset_types]
-    
-    print(f"Total number of samples: {[len(ds) for ds in loaded]}")
-
-
-    merged = ConcatDataset(loaded)
-    train_set, val_set = random_split(
-        merged,
-        [config.train_split_size, config.test_split_size]
-    )
-    train_loader = DataLoader(
-        train_set, batch_size=batch_size,
-        shuffle=config.shuffle, num_workers=config.num_workers
-    )
-    val_loader = DataLoader(
-        val_set, batch_size=batch_size,
-        shuffle=config.shuffle, num_workers=config.num_workers
-    )
-    return train_loader, val_loader
-
-
-def get_full_dataset_loader(dataset_type='carla_001', train_only_center=True) -> DataLoader:
-    ds = get_inference_dataset(dataset_type, train_only_center)
-    return DataLoader(ds, batch_size=1, shuffle=False, num_workers=1)
+            raise FileNotFoundError(f"Could not load image: {image_path}")
+        
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Get steering angle with camera-specific correction
+        steering_angle = float(row['steering_angle'])
+        
+        # Apply transforms
+        transformed = self.transform(image=image)
+        image = transformed['image']
+        
+        # Handle horizontal flip for steering angle
+        # Note: Albumentations doesn't provide flip info, so we'll do it manually
+        if np.random.random() < 0.4:  # 40% chance of flip
+            image = torch.flip(image, dims=[2])  # Flip horizontally
+            steering_angle = -steering_angle
+        
+        return image, torch.tensor(steering_angle, dtype=torch.float32)

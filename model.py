@@ -1,123 +1,50 @@
 import torch
 import torch.nn as nn
-from config import config
-
-activation = {}  # initialize the activation dictionary
-
-
-def get_activation(name):
-    def hook(model, input, output):
-        activation[name] = output.detach()
-    return hook
-
-
-class NvidiaModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-
-        # define layers using nn.Sequential
-        self.conv_layers = nn.Sequential(
-            # first convolutional layer
-            nn.Conv2d(3, 24, kernel_size=5, stride=2),
-            nn.BatchNorm2d(24),
-            nn.ReLU(),
-
-            # second convolutional layer
-            nn.Conv2d(24, 36, kernel_size=5, stride=2),
-            nn.BatchNorm2d(36),
-            nn.ReLU(),
-
-            # third convolutional layer
-            nn.Conv2d(36, 48, kernel_size=5, stride=2),
-            nn.BatchNorm2d(48),
-            nn.ReLU(),
-
-            # fourth convolutional layer
-            nn.Conv2d(48, 64, kernel_size=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-
-            # fifth convolutional layer
-            nn.Conv2d(64, 64, kernel_size=3),
-            nn.BatchNorm2d(64),
-            nn.ReLU(),
-        )
-
-        if config.is_image_logging_enabled:
-            self.conv_layers[2].register_forward_hook(get_activation('first_conv_layer'))
-            self.conv_layers[5].register_forward_hook(get_activation('second_conv_layer'))
-        
-        self.flat_layers = nn.Sequential(
-            # flatten
-            nn.Flatten(),
-            nn.Dropout(p=0.5),
-            
-            # first fully connected layer
-            nn.Linear(1152, 1164),
-            nn.BatchNorm1d(1164),
-            nn.ReLU(),
-            
-            # second fully connected layer
-            nn.Linear(1164, 100),
-            nn.BatchNorm1d(100),
-            nn.ReLU(),
-
-            # third fully connected layer
-            nn.Linear(100, 50),
-            nn.BatchNorm1d(50),
-            nn.ReLU(),
-
-            # fourth fully connected layer
-            nn.Linear(50, 10),
-
-            # output layer
-            nn.Linear(10, 1)
-        )
-
-    def forward(self, x):
-        x = self.conv_layers(x)
-        x = self.flat_layers(x)
-        return x.squeeze()
+import torchvision.models as models
 
 
 class NvidiaModelTransferLearning(nn.Module):
-    def __init__(self, resnet):
+    def __init__(self, pretrained=True, freeze_features=False):
         super().__init__()
-
-        # Use the pretrained ResNet model as the convolutional layers
-        self.conv_layers = resnet
-
-        # Define the flat layers as before
-        self.flat_layers = nn.Sequential(
-            # flatten
+        
+        # Load pretrained ResNet18 (lighter than ResNet50 for faster training)
+        resnet = models.resnet18(pretrained=pretrained)
+        
+        # Remove the final classification layer
+        self.conv_layers = nn.Sequential(*list(resnet.children())[:-1])
+        
+        # Freeze feature layers if specified
+        if freeze_features:
+            for param in self.conv_layers.parameters():
+                param.requires_grad = False
+        
+        # Custom regression head for steering prediction
+        self.regressor = nn.Sequential(
             nn.Flatten(),
-            nn.Dropout(p=0.5),
-
-            # first fully connected layer
-            nn.Linear(512, 1164),
-            nn.BatchNorm1d(1164),
+            nn.Dropout(0.5),
+            
+            nn.Linear(512, 256),  # ResNet18 outputs 512 features
+            nn.BatchNorm1d(256),
             nn.ReLU(),
-
-            # second fully connected layer
-            nn.Linear(1164, 100),
+            nn.Dropout(0.3),
+            
+            nn.Linear(256, 100),
             nn.BatchNorm1d(100),
             nn.ReLU(),
-
-            # third fully connected layer
+            nn.Dropout(0.3),
+            
             nn.Linear(100, 50),
             nn.BatchNorm1d(50),
             nn.ReLU(),
-
-            # fourth fully connected layer
+            nn.Dropout(0.2),
+            
             nn.Linear(50, 10),
-            nn.BatchNorm1d(10),
             nn.ReLU(),
-
-            # output layer
+            
             nn.Linear(10, 1)
         )
-
+        
     def forward(self, x):
         x = self.conv_layers(x)
-        x = self.flat_layers(x)
+        x = self.regressor(x)
         return x.squeeze()
