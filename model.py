@@ -3,12 +3,19 @@ import torch.nn as nn
 import torchvision.models as models
 
 
+activation = {}  # initialize the activation dictionary
+
+def get_activation(name):
+    def hook(model, input, output):
+        activation[name] = output.detach()
+    return hook
+
 class NvidiaModelTransferLearning(nn.Module):
     def __init__(self, pretrained=True, freeze_features=False):
         super().__init__()
-        
-        # Load pretrained ResNet18 (lighter than ResNet50 for faster training)
-        resnet = models.resnet18(pretrained=pretrained)
+
+        # Load pretrained ResNet34 (lighter than ResNet50 for faster training)
+        resnet = models.resnet50(pretrained=pretrained)
         
         # Remove the final classification layer
         self.conv_layers = nn.Sequential(*list(resnet.children())[:-1])
@@ -22,8 +29,8 @@ class NvidiaModelTransferLearning(nn.Module):
         self.regressor = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(0.5),
-            
-            nn.Linear(512, 256),  # ResNet18 outputs 512 features
+
+            nn.Linear(2048, 256),
             nn.BatchNorm1d(256),
             nn.ReLU(),
             nn.Dropout(0.3),

@@ -21,12 +21,14 @@ class Config:
     early_stopping_min_delta: float = 0.0001
     
     # System settings
-    num_workers: int = min(12, os.cpu_count())
+    num_workers: int = min(12, os.cpu_count()) # type: ignore
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Paths
     save_dir: str = "checkpoints"
     log_dir: str = "logs"
+    is_saving_enabled: bool = True
+    model_path: str = "save/model.pth"
 
 
 config = Config()

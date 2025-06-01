@@ -100,7 +100,7 @@ class Trainer:
             return self.patience_counter >= self.patience
 
 
-def create_data_loaders(batch_size=64, num_workers=8, use_all_cameras=True):
+def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
     """Create train and validation data loaders from all CARLA datasets"""
     
     datasets_path = Path("datasets")

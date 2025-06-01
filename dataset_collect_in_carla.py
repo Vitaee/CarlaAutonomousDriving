@@ -19,7 +19,7 @@ class CarlaDataCollector:
         self.data_queue = queue.Queue()
         self.lock = threading.Lock()
 
-        self.client = carla.Client(self.host, self.port)
+        self.client = carla.Client(self.host, self.port) # type: ignore
         self.client.set_timeout(20.0)
         
         self.map = map
@@ -37,7 +37,7 @@ class CarlaDataCollector:
             time.sleep(3)
             
             # Set weather to sunny clear sky
-            weather = carla.WeatherParameters(
+            weather = carla.WeatherParameters( # type: ignore
                 cloudiness=0.0,
                 precipitation=0.0,
                 sun_altitude_angle=70.0,
@@ -115,9 +115,9 @@ class CarlaDataCollector:
             
             # Camera transforms
             camera_transforms = {
-                'center': carla.Transform(carla.Location(x=2.0, z=1.4)),
-                'left': carla.Transform(carla.Location(x=2.0, y=-1.5, z=1.4)),
-                'right': carla.Transform(carla.Location(x=2.0, y=1.2, z=1.4))
+                'center': carla.Transform(carla.Location(x=2.0, z=1.4)), # type: ignore
+                'left': carla.Transform(carla.Location(x=2.0, y=-1.5, z=1.4)), # type: ignore
+                'right': carla.Transform(carla.Location(x=2.0, y=1.2, z=1.4)) # type: ignore
             }
             
             # Spawn cameras
@@ -146,10 +146,10 @@ class CarlaDataCollector:
         try:
             # Get vehicle control
             control = vehicle.get_control()
-            time.sleep(0.2)
+            time.sleep(0.1)
             
             velocity = vehicle.get_velocity()
-            time.sleep(0.2)
+            time.sleep(0.1)
 
             speed_kmh = 3.6 * np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
             
@@ -223,7 +223,7 @@ class CarlaDataCollector:
             latest_images = {pos: None for pos in ['center', 'left', 'right']}
             
             def camera_callback(image, position):
-                latest_images[position] = self.process_image(image)
+                latest_images[position] = self.process_image(image) # type: ignore
             
             # Attach callbacks
             for position, camera in cameras.items():
@@ -281,16 +281,16 @@ class CarlaDataCollector:
             # Cleanup
             try:
                 if 'cameras' in locals():
-                    for camera in cameras.values():
+                    for camera in cameras.values(): # type: ignore
                         camera.destroy()
                 if 'vehicle' in locals():
-                    vehicle.destroy()
+                    vehicle.destroy() # type: ignore
                 
                 # Reset world settings
                 if 'world' in locals():
-                    settings = world.get_settings()
+                    settings = world.get_settings() # type: ignore
                     settings.synchronous_mode = False
-                    world.apply_settings(settings)
+                    world.apply_settings(settings) # type: ignore
                     
             except Exception as e:
                 print(f"Thread {thread_id}: Cleanup error: {e}")
@@ -337,7 +337,7 @@ class CarlaDataCollector:
 
 def main():
     # Configuration
-    MAX_FRAMES = 400  # Adjust as needed
+    MAX_FRAMES = 19000
     HOST = 'localhost'
     BASE_PORT = 2000
     
@@ -351,9 +351,9 @@ def main():
     
    
     # Create collector
-    collector = CarlaDataCollector(host=HOST, port=BASE_PORT, max_frames=MAX_FRAMES, map='Town04')
+    collector = CarlaDataCollector(host=HOST, port=BASE_PORT, max_frames=MAX_FRAMES, map='Town01')
 
-    time.sleep(4.0)
+    time.sleep(5.0)
 
 
     # Start collection

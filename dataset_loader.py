@@ -1,5 +1,5 @@
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
 import cv2
 import numpy as np
@@ -82,3 +82,19 @@ class CarlaDataset(Dataset):
             steering_angle = -steering_angle
         
         return image, torch.tensor(steering_angle, dtype=torch.float32)
+    
+
+
+def get_inference_dataset(dataset_type='carla_001'):
+    if dataset_type == 'carla_001':
+        return CarlaDataset(
+            root_dir="datasets/dataset_carla_001_Town01",
+            use_all_cameras=True
+        )
+    else:
+        raise ValueError(f"Invalid dataset type: {dataset_type}")
+
+def get_full_dataset_loader(dataset_type='carla_001') -> DataLoader:
+    ds = get_inference_dataset(dataset_type)
+    return DataLoader(ds, batch_size=64, shuffle=False, num_workers=24)
+

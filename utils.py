@@ -28,6 +28,8 @@ def train(desc_message, model, train_subset_loader, loss_function, optimizer):
     model.train()
     batch_loss = np.array([])
 
+    epoch_loss = 0.0
+
     for data, target in tqdm(train_subset_loader, desc=desc_message, ascii=' ='):
 
         data = data.to(config.device)
@@ -126,7 +128,7 @@ def add_images_to_tensorboard(writer, epoch, fold):
 
 
 def batch_mean_and_sd():
-    loader = dataset_loader.get_full_dataset()
+    loader = dataset_loader.get_full_dataset_loader()
     cnt = 0
     fst_moment = torch.empty(3)
     snd_moment = torch.empty(3)
