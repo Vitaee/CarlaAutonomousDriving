@@ -11,9 +11,6 @@ def get_activation(name):
     return hook
 
 
-
-
-
 class NvidiaModel(nn.Module):
     def __init__(self):
         super().__init__()

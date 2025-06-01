@@ -1,340 +1,366 @@
+import carla
 import numpy as np
-import carla, cv2, threading, time, argparse, logging, csv
+import cv2
+import os
+import csv
+import threading
+import time
+import queue
 from datetime import datetime
+import concurrent.futures
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
-from dataclasses import dataclass
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
-
-@dataclass
-class SensorData:
-    """Base class to store sensor data"""
-    frame: int
-    timestamp: float
-
-@dataclass
-class CameraData(SensorData):
-    image: np.ndarray
-
-@dataclass
-class VehicleControlData(SensorData):
-    steering: float
-    throttle: float
-    brake: float
-    hand_brake: bool
-    reverse: bool
-    manual_gear_shift: bool
-    gear: int
-    turn_direction: str
-
-
-class SensorManager:
-    """Base class for all sensors"""
-    def __init__(self, world, vehicle, save_path: Path):
-        self.world = world
-        self.vehicle = vehicle
-        self.save_path = save_path
-        self.sensor = None
-        self.data_queue = Queue()
-    
-    def setup(self):
-        raise NotImplementedError
-    
-    def save_data(self, data, steering_angle, csv_writer, csv_file, csv_lock):
-        raise NotImplementedError
-    
-    def destroy(self):
-        if self.sensor is not None:
-            self.sensor.destroy()
-            self.sensor = None
-
-
-class CameraManager(SensorManager):
-    """Manager for RGB cameras with angled views"""
-    def __init__(self, world, vehicle, save_path: Path,
-                 camera_name: str = 'center',
-                 x_offset: float = 2.0,
-                 y_offset: float = 0.0,
-                 z_offset: float = 1.4,
-                 width: int = 640, height: int = 480,
-                 fov: float = 90.0,
-                 steer_correction: float = 0.0,
-                 yaw: float = 0.0,
-                 pitch: float = -5.0):
+class CarlaDataCollector:
+    def __init__(self, host='localhost', port=2000, max_frames=10000, map='Town02'):
+        self.host = host
+        self.port = port
+        self.max_frames = max_frames
+        self.frame_counter = 0
+        self.data_queue = queue.Queue()
+        self.lock = threading.Lock()
         
-        super().__init__(world, vehicle, save_path)
+        self.map = map
+        #  'Town02', 'Town03', 'Town04', 'Town05', 'Town10HD_Opt'
         
-        self.camera_name   = camera_name
-        self.x_offset      = x_offset
-        self.y_offset      = y_offset
-        self.z_offset      = z_offset
-        self.width         = width
-        self.height        = height
-        self.fov           = fov
-        self.steer_correction = steer_correction
-
-        self.yaw         = 0.0
-        self.pitch       = -5.0
-
-
-        self.image_folder = save_path / f"images_{camera_name}"
-        self.image_folder.mkdir(parents=True, exist_ok=True)
-    
-    def setup(self):
-        bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
-        bp.set_attribute('image_size_x', str(self.width))
-        bp.set_attribute('image_size_y', str(self.height))
-        bp.set_attribute('fov',         str(self.fov))
-        #bp.set_attribute('sensor_tick', '0.05')   # 20 Hz logging
-
-        loc = carla.Location(x=self.x_offset, y=self.y_offset, z=self.z_offset)
-        rot = carla.Rotation(pitch=self.pitch, yaw=self.yaw, roll=0.0)
-
-        tf  = carla.Transform(loc, rot)
-        self.sensor = self.world.spawn_actor(bp, tf, attach_to=self.vehicle, 
-                                             attachment_type=carla.AttachmentType.Rigid)  # keeps pose fixed
+        # Camera settings
+        self.camera_width = 640
+        self.camera_height = 480
+        self.camera_fov = 90
         
-        self.sensor.listen(lambda image: self._process_image(image))
-
-
-        logger.info(f"[{self.camera_name}] @ {loc}")
-    
-    def _process_image(self, image):
-        array = np.frombuffer(image.raw_data, dtype=np.dtype('uint8'))
-        array = np.reshape(array, (image.height, image.width, 4))
-        array = array[:, :, :3]
-        cam_data = CameraData(frame=image.frame, timestamp=image.timestamp, image=array)
-        self.data_queue.put(cam_data)
-    
-    def save_data(self, data: CameraData, steering_angle, csv_writer, csv_file, csv_lock):
-        filename = f"{self.camera_name}_{data.frame:06d}.png"
-        img_path = self.image_folder / filename
-        cv2.imwrite(str(img_path), cv2.cvtColor(data.image, cv2.COLOR_RGB2BGR))
-        
-        # adjust steering for side cameras
-        steering_adj = steering_angle + self.steer_correction
-        
-        with csv_lock:
-            csv_writer.writerow([filename, steering_adj, self.camera_name])
-            csv_file.flush()
-        return img_path
-
-
-class VehicleManager:
-    """Manager for collecting vehicle control data"""
-    def __init__(self, vehicle, save_path: Path):
-        self.vehicle = vehicle
-        self.save_path = save_path
-        self.control_folder = save_path / 'vehicle_data'
-        self.control_folder.mkdir(parents=True, exist_ok=True)
-    
-    def save_control_data(self, data: VehicleControlData):
-        file_path = self.control_folder / f"{data.frame:06d}.npy"
-        control_dict = {
-            'steering': data.steering,
-            'throttle': data.throttle,
-            'brake': data.brake,
-            'hand_brake': data.hand_brake,
-            'reverse': data.reverse,
-            'manual_gear_shift': data.manual_gear_shift,
-            'gear': data.gear,
-            'turn_direction': data.turn_direction
-        }
-        np.save(str(file_path), control_dict)
-        return file_path
-
-    def collect_control_data(self, frame: int, timestamp: float):
-        control = self.vehicle.get_control()
-        steer = control.steer
-        if steer > 0.10:
-            turn = 'right'
-        elif steer < -0.10:
-            turn = 'left'
-        else:
-            turn = 'straight'
-        vc = VehicleControlData(
-            frame=frame,
-            timestamp=timestamp,
-            steering=steer,
-            throttle=control.throttle,
-            brake=control.brake,
-            hand_brake=control.hand_brake,
-            reverse=control.reverse,
-            manual_gear_shift=control.manual_gear_shift,
-            gear=control.gear,
-            turn_direction=turn
-        )
-        self.save_control_data(vc)
-        return vc
-
-
-class DataCollector:
-    """Main class for collecting data from CARLA simulator"""
-    def __init__(self, args):
-        self.args = args
-        self.client = None
-        self.world = None
-        self.vehicle = None
-        self.cameras = []
-        self.vehicle_manager = None
-
-        # Create run directory
-        self.save_path = Path(args.save_dir) / "dataset_carla_001_Town10HD_Opt"
-        self.save_path.mkdir(parents=True, exist_ok=True)
-
-        # thread pool for async saving
-        self.executor = ThreadPoolExecutor(max_workers=12)
-
-        # frame counter and control
-        self.frame_count = 0
-        self.should_stop = False
-
-        # open annotations CSV
-        self.csv_file = open(self.save_path / 'steering_data.csv', 'w', newline='')
-        self.csv_writer = csv.writer(self.csv_file)
-        self.csv_writer.writerow(['frame_filename', 'steering_angle', 'camera_position'])
-        self._csv_lock = threading.Lock()
-
-    def setup(self):
+    def setup_world(self, client, town_name):
+        """Setup the world with the specified town"""
         try:
-            self.client = carla.Client(self.args.host, self.args.port)
-            self.client.set_timeout(self.args.timeout)
-            self.world = self.client.get_world()
-
-            # sync mode
-            settings = self.world.get_settings()
-            if self.args.sync:
-                settings.synchronous_mode = True
-                settings.fixed_delta_seconds = 0.05
-            self.world.apply_settings(settings)
-
-            self._spawn_vehicle()
-            self._setup_sensors()
-            logger.info('Setup complete')
-            return True
-        except Exception as e:
-            logger.error(f'Setup failed: {e}')
-            return False
-
-    def _spawn_vehicle(self):
-        bp_lib = self.world.get_blueprint_library()
-        vehicle_bp = bp_lib.find('vehicle.tesla.model3')
-        if vehicle_bp.has_attribute('color'):
-            vehicle_bp.set_attribute('color', '0,0,0')
-        spawn_point = self.world.get_map().get_spawn_points()[0]
-        self.vehicle = self.world.spawn_actor(vehicle_bp, spawn_point)
-        logger.info(f'Spawned vehicle at {spawn_point.location}')
-
-    def _setup_sensors(self):
-        corr = 0.20    # radians, ~11°
-        cam_configs = {
-            'center': (0.00,   0.0,   0.0),   # y_off,  yaw,  steer_corr
-            'left'  : (-0.45, -20.0, +corr),
-            'right' : (+0.45, +20.0, -corr),
-        }
-
-        for name, (y_off, yaw_deg, sc) in cam_configs.items():
-            cam = CameraManager(
-                self.world, self.vehicle, self.save_path,
-                camera_name=name,
-                x_offset=1.8,         # 1.5 m in front of CoG ≈ front bumper/hood
-                y_offset=y_off,
-                z_offset=1.4,
-                yaw=yaw_deg,
-                pitch=-5.0,
-                steer_correction=sc,
-            )
-            cam.setup()
-            self.cameras.append(cam)
+            world = client.load_world(town_name)
+            time.sleep(3)
             
-        self.vehicle_manager = VehicleManager(self.vehicle, self.save_path)
+            # Set weather to sunny clear sky
+            weather = carla.WeatherParameters(
+                cloudiness=0.0,
+                precipitation=0.0,
+                sun_altitude_angle=70.0,
+                sun_azimuth_angle=0.0,
+                precipitation_deposits=0.0,
+                wind_intensity=0.0,
+                fog_density=0.0,
+                wetness=0.0
+            )
+            world.set_weather(weather)
 
-    def process_sensor_data(self, steering_angle: float):
-        for cam in self.cameras:
-            while not cam.data_queue.empty():
-                data = cam.data_queue.get()
-                self.executor.submit(
-                    cam.save_data,
-                    data,
-                    steering_angle,
-                    self.csv_writer,
-                    self.csv_file,
-                    self._csv_lock
-                )
-
-    def collect_data_step(self):
-        if self.args.sync:
-            self.world.tick()
-        else:
-            time.sleep(0.05)
-
-        timestamp = time.time()
-        control_data = self.vehicle_manager.collect_control_data(self.frame_count, timestamp)
-        self.process_sensor_data(control_data.steering)
-        self.frame_count += 1
-
-    def run(self):
+            time.sleep(3)
+            
+            # Set synchronous mode
+            settings = world.get_settings()
+            time.sleep(3)
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = 0.1  # 10 FPS
+            world.apply_settings(settings)
+            time.sleep(4)
+            return world
+        except Exception as e:
+            print(f"Error setting up world {town_name}: {e}")
+            return None
+    
+    def setup_vehicle_and_cameras(self, world, client):
+        """Setup vehicle and cameras"""
         try:
-            logger.info('Starting data collection...')
-            tm = self.client.get_trafficmanager()
-            tm.set_synchronous_mode(self.args.sync)
-            tm.ignore_lights_percentage(self.vehicle, 60)
-            self.vehicle.set_autopilot(True)
+            # Get a random spawn point
+            spawn_points = world.get_map().get_spawn_points()
+            time.sleep(1.0)
+            spawn_point = np.random.choice(spawn_points)
+            time.sleep(1.0)
 
-            while not self.should_stop:
-                self.collect_data_step()
-                if self.args.max_frames > 0 and self.frame_count >= self.args.max_frames:
-                    logger.info(f'Reached max frames ({self.args.max_frames})')
-                    self.should_stop = True
+            # Spawn vehicle
+            blueprint_library = world.get_blueprint_library()
+            time.sleep(1.0)
+            vehicle_bp = blueprint_library.filter('vehicle.tesla.model3')[0]
+            time.sleep(4.0)
+            vehicle = world.spawn_actor(vehicle_bp, spawn_point)
 
-            logger.info(f'Data collection complete: {self.frame_count} frames')
-        except KeyboardInterrupt:
-            logger.info('Interrupted by user')
+            # Wait a moment for the vehicle to settle
+            time.sleep(4.0)
+            
+            # Enable autopilot with traffic manager settings
+            traffic_manager = client.get_trafficmanager()
+            
+            time.sleep(4.0)
+            # ignore %80 of traffic lights
+            traffic_manager.ignore_lights_percentage(vehicle, 80)
+            
+            traffic_manager.set_synchronous_mode(True)
+
+            time.sleep(2.0)
+            
+            # Configure traffic manager for better driving
+            traffic_manager.set_global_distance_to_leading_vehicle(2.0)
+            traffic_manager.set_hybrid_physics_mode(True)
+            
+
+            time.sleep(2.0)
+            traffic_manager.global_percentage_speed_difference(-10.0)  # Drive 10% faster
+
+            time.sleep(2.0)
+
+            # Set vehicle to autopilot
+            vehicle.set_autopilot(True, traffic_manager.get_port())
+            
+
+            # Camera blueprint
+            camera_bp = blueprint_library.find('sensor.camera.rgb')
+            camera_bp.set_attribute('image_size_x', str(self.camera_width))
+            camera_bp.set_attribute('image_size_y', str(self.camera_height))
+            camera_bp.set_attribute('fov', str(self.camera_fov))
+            
+            # Camera transforms
+            camera_transforms = {
+                'center': carla.Transform(carla.Location(x=2.0, z=1.4)),
+                'left': carla.Transform(carla.Location(x=2.0, y=-1.5, z=1.4)),
+                'right': carla.Transform(carla.Location(x=2.0, y=1.2, z=1.4))
+            }
+            
+            # Spawn cameras
+            cameras = {}
+            for position, transform in camera_transforms.items():
+                camera = world.spawn_actor(camera_bp, transform, attach_to=vehicle)
+                cameras[position] = camera
+            
+            time.sleep(2.0)
+            return vehicle, cameras
+            
+        except Exception as e:
+            print(f"Error setting up vehicle and cameras: {e}")
+            return None, None
+    
+    def process_image(self, image):
+        """Convert CARLA image to numpy array"""
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        array = array.reshape((image.height, image.width, 4))
+        array = array[:, :, :3]  # Remove alpha channel
+        array = array[:, :, ::-1]  # BGR to RGB
+        return array
+    
+    def save_frame_data(self, vehicle, images, dataset_path, frame_num, timestamp):
+        """Save frame data (images and steering info)"""
+        try:
+            # Get vehicle control
+            control = vehicle.get_control()
+            velocity = vehicle.get_velocity()
+            speed_kmh = 3.6 * np.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+            
+            # Create directories
+            for position in ['center', 'left', 'right']:
+                os.makedirs(dataset_path / f'images_{position}', exist_ok=True)
+            
+            # Save images and collect CSV data
+            csv_data = []
+            for position, image_array in images.items():
+                filename = f'{position}_{frame_num}.png'
+                image_path = dataset_path / f'images_{position}' / filename
+                
+                # Convert RGB to BGR for OpenCV
+                image_bgr = cv2.cvtColor(image_array, cv2.COLOR_RGB2BGR)
+                cv2.imwrite(str(image_path), image_bgr)
+                
+                # Calculate steering angle offset for left/right cameras
+                base_steering = control.steer
+                if position == 'left':
+                    steering_angle = base_steering + 0.15  # Offset for left camera
+                elif position == 'right':
+                    steering_angle = base_steering - 0.15  # Offset for right camera
+                else:
+                    steering_angle = base_steering
+                
+                csv_data.append({
+                    'frame_filename': filename,
+                    'steering_angle': f'{steering_angle:.6f}',
+                    'throttle': f'{control.throttle:.6f}',
+                    'brake': f'{control.brake:.6f}',
+                    'speed_kmh': f'{speed_kmh:.2f}',
+                    'camera_position': position,
+                    'frame_number': frame_num,
+                    'timestamp': f'{timestamp:.6f}'
+                })
+            
+            return csv_data
+            
+        except Exception as e:
+            print(f"Error saving frame data: {e}")
+            return []
+    
+    def collect_data_for_town(self, town_name, thread_id):
+        """Collect data for a specific town"""
+        print(f"Thread {thread_id}: Starting data collection for {town_name}")
+        
+        # Create dataset directory
+        dataset_path = Path(f'data/dataset_carla_001_{town_name}')
+        dataset_path.mkdir(parents=True, exist_ok=True)
+        
+        # CSV file setup
+        csv_file_path = dataset_path / 'steering_data.csv'
+        csv_data_buffer = []
+        
+        try:
+            # Connect to CARLA
+            client = carla.Client(self.host, self.port + thread_id)  # Use different ports for threads
+            time.sleep(3.0)
+            client.set_timeout(15.0)
+            
+            # Setup world
+            world = self.setup_world(client, town_name)
+            time.sleep(3.0)
+            if world is None:
+                return
+            
+            # Setup vehicle and cameras
+            vehicle, cameras = self.setup_vehicle_and_cameras(world, client)
+            if vehicle is None or cameras is None:
+                return
+            
+            time.sleep(3.0)
+            # Image storage for synchronization
+            latest_images = {pos: None for pos in ['center', 'left', 'right']}
+            
+            def camera_callback(image, position):
+                latest_images[position] = self.process_image(image)
+            
+            # Attach callbacks
+            for position, camera in cameras.items():
+                camera.listen(lambda image, pos=position: camera_callback(image, pos))
+            
+            frame_count = 0
+            start_time = time.time()
+            
+            print(f"Thread {thread_id}: Starting data collection loop for {town_name}")
+            
+            while frame_count < self.max_frames:
+                try:
+                    # Tick the world
+                    world.tick()
+                    
+                    # Wait for all cameras to capture
+                    if all(img is not None for img in latest_images.values()):
+                        current_time = time.time() - start_time
+                        
+                        # Save frame data
+                        frame_data = self.save_frame_data(
+                            vehicle, latest_images.copy(), dataset_path, 
+                            frame_count, current_time
+                        )
+                        
+                        csv_data_buffer.extend(frame_data)
+                        
+                        # Write to CSV every 100 frames
+                        if len(csv_data_buffer) >= 300:  # 100 frames * 3 cameras
+                            self.write_csv_data(csv_file_path, csv_data_buffer)
+                            csv_data_buffer = []
+                        
+                        frame_count += 1
+                        
+                        if frame_count % 500 == 0:
+                            print(f"Thread {thread_id} ({town_name}): Collected {frame_count} frames")
+                        
+                        # Reset images
+                        latest_images = {pos: None for pos in ['center', 'left', 'right']}
+                
+                except Exception as e:
+                    print(f"Thread {thread_id}: Error in collection loop: {e}")
+                    break
+            
+            # Write remaining CSV data
+            if csv_data_buffer:
+                self.write_csv_data(csv_file_path, csv_data_buffer)
+            
+            print(f"Thread {thread_id}: Completed data collection for {town_name}")
+            
+        except Exception as e:
+            print(f"Thread {thread_id}: Error in {town_name}: {e}")
+        
         finally:
-            self.cleanup()
-
-    def cleanup(self):
-        logger.info('Cleaning up resources...')
-        self.executor.shutdown()
-        for cam in self.cameras:
-            cam.destroy()
-        if self.vehicle:
-            self.vehicle.destroy()
-        if self.world and self.args.sync:
-            settings = self.world.get_settings()
-            settings.synchronous_mode = False
-            settings.fixed_delta_seconds = None
-            self.world.apply_settings(settings)
-        self.csv_file.close()
-        logger.info('Cleanup complete')
-
-
-def parse_arguments():
-    parser = argparse.ArgumentParser(description='Collect data from CARLA for DL model training')
-    parser.add_argument('--host', default='127.0.0.1', help='CARLA server host')
-    parser.add_argument('--port', default=2000, type=int, help='CARLA server port')
-    parser.add_argument('--timeout', default=5.0, type=float, help='CARLA client timeout')
-    parser.add_argument('--sync', action='store_true', help='Enable synchronous mode')
-    parser.add_argument('--save-dir', default='./dataset_new', help='Directory to save collected data')
-    # 11.000 : 33.180 frame,  22000 
-    parser.add_argument('--max-frames', default=500, type=int, help='Maximum number of frames to collect (-1 for unlimited)')
-    parser.add_argument('--steer-correction', type=float, default=0.2,
-                        help='Steering adjustment for left/right camera views')
-    return parser.parse_args()
-
+            # Cleanup
+            try:
+                if 'cameras' in locals():
+                    for camera in cameras.values():
+                        camera.destroy()
+                if 'vehicle' in locals():
+                    vehicle.destroy()
+                
+                # Reset world settings
+                if 'world' in locals():
+                    settings = world.get_settings()
+                    settings.synchronous_mode = False
+                    world.apply_settings(settings)
+                    
+            except Exception as e:
+                print(f"Thread {thread_id}: Cleanup error: {e}")
+    
+    def write_csv_data(self, csv_file_path, csv_data_buffer):
+        """Write CSV data to file"""
+        try:
+            file_exists = csv_file_path.exists()
+            
+            with open(csv_file_path, 'a', newline='') as csvfile:
+                fieldnames = ['frame_filename', 'steering_angle', 'throttle', 'brake', 
+                             'speed_kmh', 'camera_position', 'frame_number', 'timestamp']
+                writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+                
+                if not file_exists:
+                    writer.writeheader()
+                
+                writer.writerows(csv_data_buffer)
+                
+        except Exception as e:
+            print(f"Error writing CSV data: {e}")
+    
+    def run_collection(self):
+        """Run data collection using multiple threads"""
+        print(f"Starting data collection with {len([self.map])} threads")
+        print(f"Max frames per town: {self.max_frames}")
+        
+        # Use ThreadPoolExecutor for better thread management
+        with concurrent.futures.ThreadPoolExecutor(max_workers=12) as executor:
+            futures = []
+            
+            for i, town in enumerate([self.map]):
+                future = executor.submit(self.collect_data_for_town, town, i)
+                futures.append(future)
+            
+            # Wait for all threads to complete
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Thread completed with error: {e}")
+        
+        print("Data collection completed for all towns!")
 
 def main():
-    args = parse_arguments()
-    collector = DataCollector(args)
-    if collector.setup():
-        collector.run()
-    else:
-        logger.error('Failed to set up data collector')
+    # Configuration
+    MAX_FRAMES = 19000  # Adjust as needed
+    HOST = 'localhost'
+    BASE_PORT = 2000
+    
+    print("CARLA Data Collector")
+    print(f"Target frames per town: {MAX_FRAMES}")
+    print("Make sure CARLA simulator is running!")
+
+    maps  =  [
+        'Town01', 'Town02', 'Town03', 'Town04', 'Town05', 'Town10HD_Opt'
+    ]
+    
+   
+    # Create collector
+    collector = CarlaDataCollector(host=HOST, port=BASE_PORT, max_frames=MAX_FRAMES, map='Town03')
+
+    time.sleep(4.0)
 
 
-if __name__ == '__main__':
+    # Start collection
+    try:
+        collector.run_collection()
+    except KeyboardInterrupt:
+        print("\nData collection interrupted by user")
+    except Exception as e:
+        print(f"Error during data collection: {e}")
+
+
+if __name__ == "__main__":
     main()

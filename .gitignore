@@ -3,15 +3,19 @@ __pycache__
 *.pyo
 *.pyd
 
+data/
+data/*
 datasets/
 dataset/
 dataset_*/
 *.db
 *.sqlite
 
+enhanced*/
 save/
 save_center/
 save_new/
+save*/
 logs/
 log/
 *.csv
@@ -26,7 +30,7 @@ venv
 .idea
 .vscode
 
-
+test*/
 inference_results/
 visualization/
 *.json
