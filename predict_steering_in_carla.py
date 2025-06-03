@@ -3,217 +3,373 @@ import cv2
 import numpy as np
 import time
 import argparse
-import math, torch
+import torch
+import math
+from pathlib import Path
+
+# Import your model (adjust import based on your file structure)
+from model import NvidiaModelTransferLearning
 from config import config
-from model import NvidiaModel
 
 
-# --- Global variable for actor cleanup ---
-actor_list = []
-
-model_class = NvidiaModel
-model = model_class()
-model.load_state_dict(torch.load("./save_new/model.pt", map_location=torch.device(config.device)))
-model.to(config.device)
-model.eval()
-
-def predict_steering_angle(carla_image_bgr):
-    """
-    Process CARLA image to match exact training pipeline
-    """
-    # Convert BGR to YUV (match training)
-    image_yuv = cv2.cvtColor(carla_image_bgr, cv2.COLOR_BGR2YUV)
-    
-    # Resize to exact training dimensions
-    image_resized = cv2.resize(image_yuv, (200, 66))  # Width, Height
-    
-    # Convert to torch tensor with training normalization
-    image = np.transpose(image_resized, (2, 0, 1))
-    image = torch.from_numpy(image).float()
-    image = (image / 127.5) - 1.0  # Match training normalization
-    
-    # Add batch dimension and move to device
-    image = image.unsqueeze(0).to(config.device)
-    
-    # Predict
-    with torch.no_grad():
-        prediction = model(image)
-    
-    return prediction.item()  # Returns angle in radians
-
-def carla_image_to_rgb_array(carla_image):
-    """
-    Converts a CARLA image to match training data format.
-    Training data was saved as BGR, so we need to maintain consistency.
-    """
-    if not carla_image:
-        return None
-    
-    raw_data = np.frombuffer(carla_image.raw_data, dtype=np.uint8)
-    bgra_image = raw_data.reshape((carla_image.height, carla_image.width, 4))
-    
-    # Remove alpha channel - keep as BGR to match training
-    bgr_image = bgra_image[:, :, :3]  
-    return bgr_image
-    
-
-def cleanup_actors():
-    """Destroys all actors in the global actor_list."""
-    print("Cleaning up spawned actors...")
-    if 'client' in globals() and client is not None:
-        client.apply_batch([carla.command.DestroyActor(actor) for actor in actor_list])
-    print(f"{len(actor_list)} actors destroyed.")
-    cv2.destroyAllWindows()
-
-def main(args):
-    global client
-    client = None
-    vehicle = None
-    camera_sensor = None
-    original_settings = None
-
-    try:
-        print(f"Connecting to CARLA server at {args.host}:{args.port}...")
-        client = carla.Client(args.host, args.port)
-        client.set_timeout(15.0)
-        world = client.get_world()
-        original_settings = world.get_settings()
-
-        # Set synchronous mode for consistent results
-        settings = world.get_settings()
-        settings.synchronous_mode = True
-        settings.fixed_delta_seconds = 0.05  # 20 FPS
-        world.apply_settings(settings)
-    
+class CarlaModelTester:
+    def __init__(self, model_path, host='localhost', port=2000):
+        self.host = host
+        self.port = port
+        self.client = None
+        self.world = None
+        self.vehicle = None
+        self.camera = None
+        self.actors = []
+        self.original_settings = None
         
+        # Load trained model
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = self.load_model(model_path)
         
-        blueprint_library = world.get_blueprint_library()
-
-        # Spawn vehicle
-        vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
-        spawn_points = world.get_map().get_spawn_points()
-        if not spawn_points:
-            print("Error: No spawn points found in the current map.")
-            return
+        # Image processing
+        self.latest_image = None
         
-        # spawn_point = spawn_points[10] longest [28] longest 2 [30] longest 3  [49] longesttt 4 [51] longest 5
-        spawn_point = spawn_points[10]
-        vehicle = world.try_spawn_actor(vehicle_bp, spawn_point)
-        if vehicle is None:
-            print("Error: Could not spawn vehicle.")
-            return
-        actor_list.append(vehicle)
-        print(f"Spawned vehicle: {vehicle.type_id} (id: {vehicle.id})")
-
-        # Spawn camera sensor with same settings as training data collection
-        camera_bp = blueprint_library.find('sensor.camera.rgb')
-        camera_bp.set_attribute('image_size_x', '640')  # Match training data
-        camera_bp.set_attribute('image_size_y', '480')  # Match training data
-        camera_bp.set_attribute('fov', '110')
-
-        camera_transform = carla.Transform(
-            carla.Location(x=1.8, y=0.0, z=1.4),  # Match training position
-            carla.Rotation(pitch=-5.0, yaw=0.0, roll=0.0)  # Match training orientation
-        )
-
-        camera_sensor = world.spawn_actor(camera_bp, camera_transform, attach_to=vehicle)
-        actor_list.append(camera_sensor)
-        print(f"Spawned camera: {camera_sensor.type_id} (id: {camera_sensor.id})")
-
-        # Create a queue to store images from the camera
-        image_queue = []
-        def camera_callback(image):
-            if len(image_queue) > 5:  # Keep queue small to avoid lag
-                image_queue.pop(0)
-            image_queue.append(image)
+    def load_model(self, model_path):
+        """Load the trained model"""
+        print(f"Loading model from {model_path}")
         
-        camera_sensor.listen(camera_callback)
-
-        print(f"Model loaded. Running simulation for {args.duration} seconds...")
-        print(f"Target speed: {args.target_speed} km/h. Press 'Q' in the OpenCV window to quit early.")
-
-        start_time = time.time()
-        cv2.namedWindow("Live Model Test - CARLA", cv2.WINDOW_AUTOSIZE)
-
-        while time.time() - start_time < args.duration:
-            world.tick()  # Advance simulation in synchronous mode
-
-            if not image_queue:
-                time.sleep(0.01)
-                continue
+        model = NvidiaModelTransferLearning()
+        
+        if Path(model_path).exists():
+            checkpoint = torch.load(model_path, map_location=self.device)
             
-            # Get the latest image
-            current_image = image_queue[-1]  # Use latest image
-            img_rgb = carla_image_to_rgb_array(current_image)
-
-            if img_rgb is None:
-                continue
-
-            try:
-                # Get steering prediction using corrected preprocessing
-                predicted_steering = predict_steering_angle(img_rgb)
-                
-                # Clamp steering to valid range
-                predicted_steering = np.clip(predicted_steering, -1.0, 1.0)
-                
-            except Exception as e:
-                print(f"Prediction error: {e}")
-                predicted_steering = 0.0  # Default to straight
-
-            # Vehicle Control
-            control = carla.VehicleControl()
-            control.steer = float(predicted_steering)
-            
-            # Speed control (same as before)
-            current_speed_mps = vehicle.get_velocity()
-            current_speed_kmh = 3.6 * math.sqrt(current_speed_mps.x**2 + current_speed_mps.y**2 + current_speed_mps.z**2)
-            
-            throttle_error = args.target_speed - current_speed_kmh
-            throttle_value = 0.5 * (throttle_error / args.target_speed) if args.target_speed > 0 else 0 
-            throttle_value = np.clip(throttle_value, 0.0, 0.3)
-            
-            if throttle_error < -2:
-                control.brake = 0.2
-                control.throttle = 0.0
+            # Handle different checkpoint formats
+            if 'model_state_dict' in checkpoint:
+                model.load_state_dict(checkpoint['model_state_dict'])
+                print(f"Loaded model with validation loss: {checkpoint.get('val_loss', 'unknown'):.6f}")
             else:
-                control.throttle = throttle_value
-                control.brake = 0.0
+                model.load_state_dict(checkpoint)
+                
+            model.to(self.device)
+            model.eval()
+            print("Model loaded successfully!")
+            return model
+        else:
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+    
+    def connect_to_carla(self):
+        """Connect to CARLA server and setup world"""
+        try:
+            print(f"Connecting to CARLA at {self.host}:{self.port}")
+            self.client = carla.Client(self.host, self.port)
+            self.client.set_timeout(20.0)
             
-            vehicle.apply_control(control)
+            #self.world = self.client.get_world()
+            self.world = self.client.load_world('Town02') # Town01, Town02, Town03, Town04, Town05, Town10HD_Opt
+            time.sleep(3)
+            # world = self.client.load_world(town_name)
+            weather = carla.WeatherParameters( # type: ignore
+                cloudiness=0.0,
+                precipitation=0.0,
+                sun_altitude_angle=70.0,
+                sun_azimuth_angle=0.0,
+                precipitation_deposits=0.0,
+                wind_intensity=0.0,
+                fog_density=0.0,
+                wetness=0.0
+            )
+            self.world.set_weather(weather)
+            time.sleep(3)
 
-            # Display
-            display_img_bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
-            cv2.putText(display_img_bgr, f"Steer: {predicted_steering:.3f}", (10, 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.putText(display_img_bgr, f"Speed: {current_speed_kmh:.2f} km/h", (10, 60), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-            cv2.imshow("Live Model Test - CARLA", display_img_bgr)
+            self.original_settings = self.world.get_settings()
+            
+            # Set synchronous mode
+            settings = self.world.get_settings()
+            settings.synchronous_mode = True
+            settings.fixed_delta_seconds = 0.1  # 0.05 20 FPS  0.1 10 FPS
+            self.world.apply_settings(settings)
+            
+            print("Connected to CARLA successfully!")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to connect to CARLA: {e}")
+            return False
+    
+    def spawn_vehicle(self, spawn_index=0):
+        """Spawn vehicle at specified spawn point"""
+        try:
+            blueprint_library = self.world.get_blueprint_library()
+            
+            # Get vehicle blueprint
+            vehicle_bp = blueprint_library.find('vehicle.tesla.model3')
+            if not vehicle_bp:
+                vehicle_bp = blueprint_library.filter('vehicle.*')[0]
 
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                print("User pressed 'Q'. Exiting...")
-                break
+            time.sleep(5)  # Wait for CARLA to stabilize
+            
+            # Get spawn points
+            spawn_points = self.world.get_map().get_spawn_points()
+            if not spawn_points:
+                raise Exception("No spawn points available")
+            
+            # Use specified spawn point or random
+            spawn_point = spawn_points[spawn_index]
+            time.sleep(5)  # Wait for CARLA to stabilize
+            self.vehicle = self.world.try_spawn_actor(vehicle_bp, spawn_point)
+            if not self.vehicle:
+                raise Exception("Failed to spawn vehicle")
+            
+            self.actors.append(self.vehicle)
+            print(f"Vehicle spawned at spawn point {spawn_index}")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to spawn vehicle: {e}")
+            return False
+    
+    def spawn_camera(self):
+        """Spawn camera sensor on vehicle"""
+        try:
+            blueprint_library = self.world.get_blueprint_library()
+            camera_bp = blueprint_library.find('sensor.camera.rgb')
+            
+            # Match your training data camera settings
+            camera_bp.set_attribute('image_size_x', '640')
+            camera_bp.set_attribute('image_size_y', '480')
+            camera_bp.set_attribute('fov', '90')
+            
+            # Camera position (match your training data)
+            camera_transform = carla.Transform(
+                carla.Location(x=2.0, z=1.4),
+                carla.Rotation(pitch=0.0)
+            )
+            
+            self.camera = self.world.spawn_actor(
+                camera_bp, camera_transform, attach_to=self.vehicle
+            )
+            self.actors.append(self.camera)
+            
+            # Set up callback
+            self.camera.listen(self.camera_callback)
+            print("Camera spawned and listening")
+            return True
+            
+        except Exception as e:
+            print(f"Failed to spawn camera: {e}")
+            return False
+    
+    def camera_callback(self, image):
+        """Process incoming camera images"""
+        # Convert CARLA image to numpy array
+        array = np.frombuffer(image.raw_data, dtype=np.uint8)
+        array = array.reshape((image.height, image.width, 4))
+        self.latest_image = array[:, :, :3]  # Remove alpha channel, keep BGR
+    
+    def predict_steering(self, image):
+        """Predict steering angle from image"""
+        try:
+            # Convert BGR to RGB for model input
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            
+            # Resize to model input size
+            image_resized = cv2.resize(image_rgb, (200, 66))
+            
+            # Normalize (match your training pipeline)
+            image_normalized = image_resized.astype(np.float32) / 255.0
+            
+            # Apply ImageNet normalization (if using pretrained model)
+            mean = np.array([0.485, 0.456, 0.406])
+            std = np.array([0.229, 0.224, 0.225])
+            image_normalized = (image_normalized - mean) / std
+            
+            # Convert to tensor with explicit float32 dtype
+            image_tensor = torch.from_numpy(image_normalized).float()  # Force float32
+            image_tensor = image_tensor.permute(2, 0, 1).unsqueeze(0)
+            image_tensor = image_tensor.to(self.device)
+            
+            # Double check tensor type
+            if image_tensor.dtype != torch.float32:
+                image_tensor = image_tensor.float()
+            
+            # Predict
+            with torch.no_grad():
+                prediction = self.model(image_tensor)
+                steering_angle = prediction.item()
+            
+            # Clamp to valid range
+            return np.clip(steering_angle, -1.0, 1.0)
+            
+        except Exception as e:
+            print(f"Prediction error: {e}")
+            return 0.0
+    
 
-        print("Simulation time ended or user quit.")
 
-    except Exception as e:
-        print(f"An error occurred: {e}")
-        import traceback
-        traceback.print_exc()
+    def run_test(self, duration=60, target_speed=15, spawn_index=0):
+        """Run the autonomous driving test"""
+        
+        # Setup
+        if not self.connect_to_carla():
+            return False
+        
+        if not self.spawn_vehicle(spawn_index):
+            return False
+        
+        if not self.spawn_camera():
+            return False
+        
+        print(f"Starting test run for {duration} seconds")
+        print(f"Target speed: {target_speed} km/h")
+        print("Press 'Q' to quit early")
+        
+        # Create display window
+        cv2.namedWindow("CARLA Model Test", cv2.WINDOW_AUTOSIZE)
+        
+        start_time = time.time()
+        frame_count = 0
+        
+        try:
+            while time.time() - start_time < duration:
+                # Tick simulation
+                self.world.tick()
+                
+                # Check if we have an image
+                if self.latest_image is None:
+                    time.sleep(0.01)
+                    continue
+                
+                # Predict steering
+                predicted_steering = self.predict_steering(self.latest_image)
+                
+                # Get current vehicle state
+                velocity = self.vehicle.get_velocity()
+                current_speed = 3.6 * math.sqrt(velocity.x**2 + velocity.y**2 + velocity.z**2)
+                
+                # Speed control
+                speed_error = target_speed - current_speed
+                if speed_error > 2:
+                    throttle = 0.6
+                    brake = 0.0
+                elif speed_error < -2:
+                    throttle = 0.0
+                    brake = 0.3
+                else:
+                    throttle = 0.3
+                    brake = 0.0
+                
+                # Apply control
+                control = carla.VehicleControl(
+                    throttle=throttle,
+                    steer=predicted_steering,
+                    brake=brake
+                )
+                self.vehicle.apply_control(control)
+                
+                # Display
+                display_image = self.latest_image.copy()
+                
+                # Add text overlay
+                cv2.putText(display_image, f"Steering: {predicted_steering:.3f}", 
+                           (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(display_image, f"Speed: {current_speed:.1f} km/h", 
+                           (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                cv2.putText(display_image, f"Target: {target_speed:.1f} km/h", 
+                           (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+                cv2.putText(display_image, f"Time: {time.time() - start_time:.1f}s", 
+                           (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+                
+                # Show image
+                cv2.imshow("CARLA Model Test", display_image)
+                
+                # Check for quit
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    print("User requested quit")
+                    break
+                
+                frame_count += 1
+                
+                # Print stats every 5 seconds
+                if frame_count % 100 == 0:
+                    elapsed = time.time() - start_time
+                    fps = frame_count / elapsed
+                    print(f"Time: {elapsed:.1f}s, FPS: {fps:.1f}, Speed: {current_speed:.1f} km/h, Steering: {predicted_steering:.3f}")
+        
+        except KeyboardInterrupt:
+            print("Test interrupted by user")
+        
+        except Exception as e:
+            print(f"Error during test: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        finally:
+            self.cleanup()
+        
+        return True
+    
+    def cleanup(self):
+        """Clean up all spawned actors and restore settings"""
+        print("Cleaning up...")
+        
+        # Destroy actors
+        if self.client:
+            for actor in self.actors:
+                try:
+                    actor.destroy()
+                except:
+                    pass
+        
+        # Restore original settings
+        if self.world and self.original_settings:
+            try:
+                self.world.apply_settings(self.original_settings)
+            except:
+                pass
+        
+        # Close OpenCV windows
+        cv2.destroyAllWindows()
+        
+        print("Cleanup complete")
 
-    finally:
-        if client and original_settings:
-            print("Restoring original world settings...")
-            world.apply_settings(original_settings)
-        cleanup_actors()
-        print("Exiting test script.")
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Test a trained self-driving model in CARLA.")
-    parser.add_argument('--host', default='localhost', help='CARLA server host IP address')
-    parser.add_argument('--port', default=2000, type=int, help='CARLA server port')
-    parser.add_argument('--duration', default=300, type=int, help='Duration in seconds')
-    parser.add_argument('--target_speed', default=7, type=float, help='Target speed in km/h')
+def main():
+    # python predict_steering_in_carla.py --model_path "carla_steering_best_42.pt" --spawn_point 34 --target_speed 7 --duration 180
+    # python predict_steering_in_carla.py --model_path "carla_steering_23.pt" --spawn_point 25 --target_speed 6 --duration 180
+
+    # python predict_steering_in_carla.py --model_path "checkpoints/carla_steering_best.pt" --spawn_point 34 --target_speed 7 --duration 180
+    parser = argparse.ArgumentParser(description="Test trained model in CARLA")
+    parser.add_argument('--model_path', type=str, required=True,
+                       help='Path to the trained model file')
+    parser.add_argument('--host', type=str, default='localhost',
+                       help='CARLA server host')
+    parser.add_argument('--port', type=int, default=2000,
+                       help='CARLA server port')
+    parser.add_argument('--duration', type=int, default=60,
+                       help='Test duration in seconds')
+    parser.add_argument('--target_speed', type=float, default=15,
+                       help='Target speed in km/h')
+    parser.add_argument('--spawn_point', type=int, default=0,
+                       help='Spawn point index')
     
     args = parser.parse_args()
-    main(args)
+    
+    # Create tester
+    tester = CarlaModelTester(
+        model_path=args.model_path,
+        host=args.host,
+        port=args.port
+    )
+    
+    # Run test
+    success = tester.run_test(
+        duration=args.duration,
+        target_speed=args.target_speed,
+        spawn_index=args.spawn_point
+    )
+    
+    if success:
+        print("Test completed successfully!")
+    else:
+        print("Test failed!")
+
+
+if __name__ == '__main__':
+    main()

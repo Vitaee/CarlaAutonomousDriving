@@ -35,3 +35,14 @@ inference_results/
 visualization/
 *.json
 *.log
+
+checkpoints/*
+carla_steering*
+*.pt
+*.pth
+*.pth.tar
+*.pth.tar.gz
+*.pth.tar.gz.part
+*.pth.tar.gz.part.1
+
+presentation_plots/*

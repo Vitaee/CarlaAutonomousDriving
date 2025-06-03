@@ -23,12 +23,17 @@ class Trainer:
         
         # Loss and optimizer
         self.criterion = nn.MSELoss()
-        self.optimizer = optim.Adam(
-            model.parameters(), 
-            lr=config.learning_rate, 
-            weight_decay=config.weight_decay
-        )
+        backbone, head = [], []
+        for n,p in model.named_parameters():
+            (head if n.startswith('regressor') else backbone).append(p)
+
+        self.optimizer = optim.Adam([
+            {'params': backbone, 'lr': 1e-4},
+            {'params': head,     'lr': 1e-3}
+        ], weight_decay=1e-4)
         
+
+       
         # Learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', patience=5, factor=0.5
@@ -103,17 +108,18 @@ class Trainer:
 def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
     """Create train and validation data loaders from all CARLA datasets"""
     
-    datasets_path = Path("datasets")
+    datasets_path = Path("data")
     town_folders = [
         "dataset_carla_001_Town01",
         "dataset_carla_001_Town02", 
         "dataset_carla_001_Town03",
         "dataset_carla_001_Town04",
-        #"dataset_carla_001_Town05",
+        "dataset_carla_001_Town05",
         #"dataset_carla_001_Town10HD_Opt"
     ]
     
     all_datasets = []
+    all_samplers = []
     
     for town_folder in town_folders:
         town_path = datasets_path / town_folder
@@ -124,6 +130,7 @@ def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
                 use_all_cameras=use_all_cameras
             )
             all_datasets.append(dataset)
+            all_samplers.append(dataset.sampler)
             print(f"  Loaded {len(dataset)} samples")
         else:
             print(f"Warning: {town_folder} not found")
@@ -134,6 +141,22 @@ def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
     # Combine all datasets
     combined_dataset = ConcatDataset(all_datasets)
     print(f"Total combined samples: {len(combined_dataset)}")
+    
+    # Create combined sampler weights
+    combined_weights = []
+    cumulative_size = 0
+    for dataset, sampler in zip(all_datasets, all_samplers):
+        # Get weights from the sampler
+        dataset_weights = sampler.weights
+        combined_weights.extend(dataset_weights)
+        cumulative_size += len(dataset)
+    
+    # Create combined sampler
+    combined_sampler = torch.utils.data.WeightedRandomSampler(
+        weights=combined_weights,
+        num_samples=len(combined_weights),
+        replacement=True
+    )
     
     # Split into train/val
     train_size = int(config.train_split_size * len(combined_dataset))
@@ -146,12 +169,21 @@ def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
     
     print(f"Train samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
+
+    # Create train sampler for the subset
+    train_indices = train_dataset.indices
+    train_weights = [combined_weights[i] for i in train_indices]
+    train_sampler = torch.utils.data.WeightedRandomSampler(
+        weights=train_weights,
+        num_samples=len(train_weights),
+        replacement=True
+    )
     
     # Create data loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        sampler=train_sampler,  # Use balanced sampler instead of shuffle=True
         num_workers=num_workers,
         pin_memory=True,
         persistent_workers=True if num_workers > 0 else False
@@ -171,14 +203,14 @@ def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
 
 def main():
     parser = argparse.ArgumentParser(description="Train CARLA Steering Model")
-    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--use_all_cameras", action="store_true", default=True, 
                        help="Use all three cameras (center, left, right)")
     parser.add_argument("--run_name", type=str, default="carla_steering", 
                        help="Run name for tensorboard")
-    parser.add_argument("--num_workers", type=int, default=8, help="Number of data loader workers")
+    parser.add_argument("--num_workers", type=int, default=24, help="Number of data loader workers")
     
     args = parser.parse_args()
     

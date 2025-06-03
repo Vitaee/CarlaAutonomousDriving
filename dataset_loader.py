@@ -8,6 +8,7 @@ from pathlib import Path
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
+CAM_OFFSET = {"left": 0.10, "center": 0.0, "right": -0.10}
 
 class CarlaDataset(Dataset):
     def __init__(self, root_dir, csv_file="steering_data.csv", use_all_cameras=True):
@@ -26,18 +27,17 @@ class CarlaDataset(Dataset):
         self.image_dirs = {
             'center': self.root_dir / 'images_center',
             'left': self.root_dir / 'images_left', 
-            'right': self.root_dir / 'images_right'
-        }
+            'right': self.root_dir / 'images_right'        }
         
-        # Data augmentation pipeline
-        self.transform = A.Compose([
+        # Data augmentation pipeline - using ReplayCompose to track transformations
+        self.transform = A.ReplayCompose([
             A.Resize(66, 200),  # Nvidia model input size
             A.OneOf([
                 A.RandomBrightnessContrast(brightness_limit=0.2, contrast_limit=0.2, p=0.5),
                 A.HueSaturationValue(hue_shift_limit=10, sat_shift_limit=15, val_shift_limit=10, p=0.5),
                 A.RandomGamma(gamma_limit=(80, 120), p=0.3),
             ], p=0.3),
-            A.HorizontalFlip(p=0.5),  # We'll handle steering angle adjustment manually
+            A.HorizontalFlip(p=0.5),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
             ToTensorV2()
         ]) # type: ignore
@@ -45,10 +45,46 @@ class CarlaDataset(Dataset):
         self.transform_val = A.Compose([
             A.Resize(66, 200),
             A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
-            ToTensorV2()
-        ])
+            ToTensorV2()        ])
+          # Create balanced sampler for steering angles
+        self.sampler = self._create_balanced_sampler()
         
         print(f"Loaded {len(self.data)} samples from {root_dir}")
+    
+    def _create_balanced_sampler(self):
+        """Create a weighted sampler to balance steering angle distribution"""
+        steering_angles = np.array(self.data['steering_angle'].values, dtype=np.float32)
+        
+        # Create histogram of steering angles
+        hist, bins = np.histogram(steering_angles, bins=41, range=(-0.4, 0.4))
+        
+        # Get bin indices for each steering angle
+        bin_indices = np.digitize(steering_angles, bins) - 1
+        
+        # Clip indices to valid range [0, len(hist)-1] to handle edge cases
+        bin_indices = np.clip(bin_indices, 0, len(hist) - 1)
+        
+        # Calculate weights (inverse frequency)
+        weights = 1.0 / (hist[bin_indices] + 1e-6)
+        
+        # Normalize weights
+        weights = weights / weights.sum() * len(weights)
+        
+        # Create WeightedRandomSampler
+        sampler = torch.utils.data.WeightedRandomSampler(
+            weights=weights, 
+            num_samples=len(weights), 
+            replacement=True
+        )
+        
+        # Print distribution info
+        print(f"  Steering angle distribution:")
+        print(f"    Range: [{steering_angles.min():.3f}, {steering_angles.max():.3f}]")
+        print(f"    Mean: {steering_angles.mean():.3f}, Std: {steering_angles.std():.3f}")
+        print(f"    Histogram (bins={len(hist)}): min={hist.min()}, max={hist.max()}")
+        print(f"    Bin indices range: [{bin_indices.min()}, {bin_indices.max()}]")
+        
+        return sampler
     
     def __len__(self):
         return len(self.data)
@@ -70,16 +106,20 @@ class CarlaDataset(Dataset):
         
         # Get steering angle with camera-specific correction
         steering_angle = float(row['steering_angle'])
+        # Apply camera offset correction
+        steering_angle += CAM_OFFSET[camera_pos]
         
-        # Apply transforms
+        # Apply transforms with replay tracking
         transformed = self.transform(image=image)
         image = transformed['image']
         
-        # Handle horizontal flip for steering angle
-        # Note: Albumentations doesn't provide flip info, so we'll do it manually
-        if np.random.random() < 0.4:  # 40% chance of flip
-            image = torch.flip(image, dims=[2])  # Flip horizontally
-            steering_angle = -steering_angle
+        # Check if horizontal flip was applied and adjust steering angle accordingly
+        replay_data = transformed.get('replay', {})
+        if replay_data:
+            for transform_info in replay_data.get('transforms', []):
+                if transform_info['__class_fullname__'] == 'HorizontalFlip' and transform_info['applied']:
+                    steering_angle = -steering_angle
+                    break
         
         return image, torch.tensor(steering_angle, dtype=torch.float32)
     
@@ -88,7 +128,7 @@ class CarlaDataset(Dataset):
 def get_inference_dataset(dataset_type='carla_001'):
     if dataset_type == 'carla_001':
         return CarlaDataset(
-            root_dir="datasets/dataset_carla_001_Town01",
+            root_dir="data/dataset_carla_001_Town01",
             use_all_cameras=True
         )
     else:

@@ -351,7 +351,7 @@ def main():
     
    
     # Create collector
-    collector = CarlaDataCollector(host=HOST, port=BASE_PORT, max_frames=MAX_FRAMES, map='Town01')
+    collector = CarlaDataCollector(host=HOST, port=BASE_PORT, max_frames=MAX_FRAMES, map='Town05')
 
     time.sleep(5.0)
 
