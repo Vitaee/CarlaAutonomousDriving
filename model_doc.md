@@ -146,9 +146,9 @@ def forward(self, x):
 
 | Component | Input Shape | Output Shape | Parameters |
 |-----------|-------------|--------------|------------|
-| ResNet-50 Features | [B, 3, 224, 224] | [B, 2048, 1, 1] | ~23M (frozen/trainable) |
+| ResNet-50 Features | [B, 3, 224, 224] | [B, 2048, 1, 1] | ~23M |
 | Regression Head | [B, 2048] | [B, 1] | ~570K |
-| **Total** | **[B, 3, 224, 224]** | **[B]** | **~23.6M** |
+| Total | [B, 3, 224, 224] | [B] | ~23.6M |
 
 ## Key Design Decisions
 

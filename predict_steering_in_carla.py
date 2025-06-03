@@ -61,7 +61,7 @@ class CarlaModelTester:
             self.client.set_timeout(20.0)
             
             #self.world = self.client.get_world()
-            self.world = self.client.load_world('Town02') # Town01, Town02, Town03, Town04, Town05, Town10HD_Opt
+            self.world = self.client.load_world('Town10HD_Opt') # Town01, Town02, Town03, Town04, Town05, Town10HD_Opt
             time.sleep(3)
             # world = self.client.load_world(town_name)
             weather = carla.WeatherParameters( # type: ignore
