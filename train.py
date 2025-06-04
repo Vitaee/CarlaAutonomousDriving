@@ -3,37 +3,51 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader, ConcatDataset
 import argparse
 from pathlib import Path
 from tqdm import tqdm
 import numpy as np
 
-from model import NvidiaModelTransferLearning
-from dataset_loader import CarlaDataset
+from model import MultiControlAutonomousModel, SpeedAwareAutonomousModel
+from dataset_loader import create_multi_output_data_loaders
 from config import config
 
 
-class Trainer:
-    def __init__(self, model, train_loader, val_loader, device):
+class MultiControlTrainer:
+    def __init__(self, model, train_loader, val_loader, device, use_speed_input=False):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
+        self.use_speed_input = use_speed_input
         
-        # Loss and optimizer
-        self.criterion = nn.MSELoss()
-        backbone, head = [], []
-        for n,p in model.named_parameters():
-            (head if n.startswith('regressor') else backbone).append(p)
-
+        # Different loss functions for different outputs
+        self.steering_criterion = nn.MSELoss()  # Precise steering control
+        self.throttle_criterion = nn.MSELoss()  # Smooth acceleration
+        self.brake_criterion = nn.MSELoss()     # Smooth braking
+        
+        # Loss weights (can be tuned)
+        self.loss_weights = {
+            'steering': 2.0,  # Most important for safety
+            'throttle': 1.0,
+            'brake': 1.5      # Important for safety
+        }
+        
+        # Optimizer with different learning rates for different components
+        backbone_params = []
+        head_params = []
+        
+        for name, param in model.named_parameters():
+            if 'conv_layers' in name:
+                backbone_params.append(param)
+            else:
+                head_params.append(param)
+        
         self.optimizer = optim.Adam([
-            {'params': backbone, 'lr': 1e-4},
-            {'params': head,     'lr': 1e-3}
+            {'params': backbone_params, 'lr': 1e-4},
+            {'params': head_params, 'lr': 1e-3}
         ], weight_decay=1e-4)
         
-
-       
         # Learning rate scheduler
         self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
             self.optimizer, mode='min', patience=5, factor=0.5
@@ -42,196 +56,175 @@ class Trainer:
         # Early stopping
         self.best_val_loss = float('inf')
         self.patience_counter = 0
-        self.patience = config.early_stopping_patience
+        self.patience = 10
         
     def train_epoch(self):
         self.model.train()
-        total_loss = 0.0
+        total_losses = {'steering': 0.0, 'throttle': 0.0, 'brake': 0.0, 'total': 0.0}
         
         with tqdm(self.train_loader, desc="Training", leave=False) as pbar:
-            for batch_idx, (images, targets) in enumerate(pbar):
-                images = images.to(self.device, non_blocking=True)
-                targets = targets.to(self.device, non_blocking=True)
+            for batch_idx, batch_data in enumerate(pbar):
+                
+                if self.use_speed_input:
+                    images, targets, speeds = batch_data
+                    images = images.to(self.device, non_blocking=True)
+                    speeds = speeds.to(self.device, non_blocking=True)
+                else:
+                    images, targets = batch_data
+                    images = images.to(self.device, non_blocking=True)
+                    speeds = None
+                
+                # Move targets to device
+                steering_targets = targets['steering'].to(self.device, non_blocking=True)
+                throttle_targets = targets['throttle'].to(self.device, non_blocking=True)
+                brake_targets = targets['brake'].to(self.device, non_blocking=True)
                 
                 # Forward pass
                 self.optimizer.zero_grad()
-                outputs = self.model(images)
-                loss = self.criterion(outputs, targets)
+                
+                if self.use_speed_input:
+                    outputs = self.model(images, speeds)
+                else:
+                    outputs = self.model(images)
+                
+                # Calculate individual losses
+                steering_loss = self.steering_criterion(outputs['steering'], steering_targets)
+                throttle_loss = self.throttle_criterion(outputs['throttle'], throttle_targets)
+                brake_loss = self.brake_criterion(outputs['brake'], brake_targets)
+                
+                # Weighted total loss
+                total_loss = (
+                    self.loss_weights['steering'] * steering_loss +
+                    self.loss_weights['throttle'] * throttle_loss +
+                    self.loss_weights['brake'] * brake_loss
+                )
                 
                 # Backward pass
-                loss.backward()
+                total_loss.backward()
                 self.optimizer.step()
                 
-                total_loss += loss.item()
-                pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+                # Track losses
+                total_losses['steering'] += steering_loss.item()
+                total_losses['throttle'] += throttle_loss.item()
+                total_losses['brake'] += brake_loss.item()
+                total_losses['total'] += total_loss.item()
+                
+                pbar.set_postfix({
+                    'total': f'{total_loss.item():.4f}',
+                    'steer': f'{steering_loss.item():.4f}',
+                    'throttle': f'{throttle_loss.item():.4f}',
+                    'brake': f'{brake_loss.item():.4f}'
+                })
         
-        return total_loss / len(self.train_loader)
+        # Return average losses
+        n_batches = len(self.train_loader)
+        return {key: loss / n_batches for key, loss in total_losses.items()}
     
     def validate_epoch(self):
         self.model.eval()
-        total_loss = 0.0
+        total_losses = {'steering': 0.0, 'throttle': 0.0, 'brake': 0.0, 'total': 0.0}
         
         with torch.no_grad():
             with tqdm(self.val_loader, desc="Validation", leave=False) as pbar:
-                for images, targets in pbar:
-                    images = images.to(self.device, non_blocking=True)
-                    targets = targets.to(self.device, non_blocking=True)
+                for batch_data in pbar:
                     
-                    outputs = self.model(images)
-                    loss = self.criterion(outputs, targets)
+                    if self.use_speed_input:
+                        images, targets, speeds = batch_data
+                        images = images.to(self.device, non_blocking=True)
+                        speeds = speeds.to(self.device, non_blocking=True)
+                    else:
+                        images, targets = batch_data
+                        images = images.to(self.device, non_blocking=True)
+                        speeds = None
                     
-                    total_loss += loss.item()
-                    pbar.set_postfix({'loss': f'{loss.item():.6f}'})
+                    steering_targets = targets['steering'].to(self.device, non_blocking=True)
+                    throttle_targets = targets['throttle'].to(self.device, non_blocking=True)
+                    brake_targets = targets['brake'].to(self.device, non_blocking=True)
+                    
+                    # Forward pass
+                    if self.use_speed_input:
+                        outputs = self.model(images, speeds)
+                    else:
+                        outputs = self.model(images)
+                    
+                    # Calculate losses
+                    steering_loss = self.steering_criterion(outputs['steering'], steering_targets)
+                    throttle_loss = self.throttle_criterion(outputs['throttle'], throttle_targets)
+                    brake_loss = self.brake_criterion(outputs['brake'], brake_targets)
+                    
+                    total_loss = (
+                        self.loss_weights['steering'] * steering_loss +
+                        self.loss_weights['throttle'] * throttle_loss +
+                        self.loss_weights['brake'] * brake_loss
+                    )
+                    
+                    total_losses['steering'] += steering_loss.item()
+                    total_losses['throttle'] += throttle_loss.item()
+                    total_losses['brake'] += brake_loss.item()
+                    total_losses['total'] += total_loss.item()
+                    
+                    pbar.set_postfix({
+                        'total': f'{total_loss.item():.4f}',
+                        'steer': f'{steering_loss.item():.4f}',
+                        'throttle': f'{throttle_loss.item():.4f}',
+                        'brake': f'{brake_loss.item():.4f}'
+                    })
         
-        return total_loss / len(self.val_loader)
+        n_batches = len(self.val_loader)
+        return {key: loss / n_batches for key, loss in total_losses.items()}
     
-    def save_checkpoint(self, epoch, val_loss, filepath):
+    def save_checkpoint(self, epoch, val_losses, filepath):
         checkpoint = {
             'epoch': epoch,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'scheduler_state_dict': self.scheduler.state_dict(),
-            'val_loss': val_loss,
+            'val_losses': val_losses,
+            'loss_weights': self.loss_weights,
+            'use_speed_input': self.use_speed_input
         }
         torch.save(checkpoint, filepath)
-    
-    def early_stop_check(self, val_loss):
-        if val_loss < self.best_val_loss:
-            self.best_val_loss = val_loss
-            self.patience_counter = 0
-            return False
-        else:
-            self.patience_counter += 1
-            return self.patience_counter >= self.patience
-
-
-def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
-    """Create train and validation data loaders from all CARLA datasets"""
-    
-    datasets_path = Path("data")
-    town_folders = [
-        "dataset_carla_001_Town01",
-        "dataset_carla_001_Town02", 
-        "dataset_carla_001_Town03",
-        "dataset_carla_001_Town04",
-        "dataset_carla_001_Town05",
-        #"dataset_carla_001_Town10HD_Opt"
-    ]
-    
-    all_datasets = []
-    all_samplers = []
-    
-    for town_folder in town_folders:
-        town_path = datasets_path / town_folder
-        if town_path.exists():
-            print(f"Loading dataset: {town_folder}")
-            dataset = CarlaDataset(
-                root_dir=str(town_path),
-                use_all_cameras=use_all_cameras
-            )
-            all_datasets.append(dataset)
-            all_samplers.append(dataset.sampler)
-            print(f"  Loaded {len(dataset)} samples")
-        else:
-            print(f"Warning: {town_folder} not found")
-    
-    if not all_datasets:
-        raise ValueError("No datasets found!")
-    
-    # Combine all datasets
-    combined_dataset = ConcatDataset(all_datasets)
-    print(f"Total combined samples: {len(combined_dataset)}")
-    
-    # Create combined sampler weights
-    combined_weights = []
-    cumulative_size = 0
-    for dataset, sampler in zip(all_datasets, all_samplers):
-        # Get weights from the sampler
-        dataset_weights = sampler.weights
-        combined_weights.extend(dataset_weights)
-        cumulative_size += len(dataset)
-    
-    # Create combined sampler
-    combined_sampler = torch.utils.data.WeightedRandomSampler(
-        weights=combined_weights,
-        num_samples=len(combined_weights),
-        replacement=True
-    )
-    
-    # Split into train/val
-    train_size = int(config.train_split_size * len(combined_dataset))
-    val_size = len(combined_dataset) - train_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        combined_dataset, [train_size, val_size],
-        generator=torch.Generator().manual_seed(42)  # For reproducibility
-    )
-    
-    print(f"Train samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
-
-    # Create train sampler for the subset
-    train_indices = train_dataset.indices
-    train_weights = [combined_weights[i] for i in train_indices]
-    train_sampler = torch.utils.data.WeightedRandomSampler(
-        weights=train_weights,
-        num_samples=len(train_weights),
-        replacement=True
-    )
-    
-    # Create data loaders
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        sampler=train_sampler,  # Use balanced sampler instead of shuffle=True
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=True if num_workers > 0 else False
-    )
-    
-    return train_loader, val_loader
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Train CARLA Steering Model")
+    parser = argparse.ArgumentParser(description="Train Multi-Control CARLA Model")
     parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
     parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
-    parser.add_argument("--use_all_cameras", action="store_true", default=True, 
-                       help="Use all three cameras (center, left, right)")
-    parser.add_argument("--run_name", type=str, default="carla_steering", 
-                       help="Run name for tensorboard")
-    parser.add_argument("--num_workers", type=int, default=24, help="Number of data loader workers")
+    parser.add_argument("--use_all_cameras", action="store_true", default=True)
+    parser.add_argument("--use_speed_input", action="store_true", 
+                       help="Use current speed as additional input")
+    parser.add_argument("--model_type", choices=['multi_control', 'speed_aware'], 
+                       default='multi_control', help="Model architecture to use")
+    parser.add_argument("--run_name", type=str, default="carla_multi_control")
+    parser.add_argument("--num_workers", type=int, default=24)
     
     args = parser.parse_args()
-    
-    # Update config
-    config.learning_rate = args.lr
     
     # Setup device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
     # Create data loaders
-    print("Creating data loaders...")
-    train_loader, val_loader = create_data_loaders(
+    print("Creating multi-output data loaders...")
+    train_loader, val_loader = create_multi_output_data_loaders(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        use_all_cameras=args.use_all_cameras
+        use_all_cameras=args.use_all_cameras,
+        use_speed_input=args.use_speed_input
     )
     
     # Create model
-    print("Creating model...")
-    model = NvidiaModelTransferLearning()
+    print(f"Creating {args.model_type} model...")
+    if args.model_type == 'multi_control':
+        model = MultiControlAutonomousModel(
+            pretrained=True, 
+            freeze_features=False,
+            use_speed_input=args.use_speed_input
+        )
+    else:  # speed_aware
+        model = SpeedAwareAutonomousModel(pretrained=True, freeze_features=False)
+        args.use_speed_input = True  # Force speed input for this model
     
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -240,76 +233,91 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
     
     # Create trainer
-    trainer = Trainer(model, train_loader, val_loader, device)
+    trainer = MultiControlTrainer(model, train_loader, val_loader, device, args.use_speed_input)
     
     # Setup tensorboard
     writer = SummaryWriter(f'logs/{args.run_name}')
     
     # Create save directory
-    save_dir = Path("checkpoints")
+    save_dir = Path("models")
     save_dir.mkdir(exist_ok=True)
     
-    print(f"\nStarting training...")
+    print(f"\n🚗 Starting Multi-Control Autonomous Driving Training...")
     print(f"Epochs: {args.epochs}")
     print(f"Batch size: {args.batch_size}")
-    print(f"Learning rate: {args.lr}")
-    print(f"Use all cameras: {args.use_all_cameras}")
+    print(f"Model type: {args.model_type}")
+    print(f"Use speed input: {args.use_speed_input}")
+    print(f"Outputs: Steering + Throttle + Brake")
     
     start_time = time.time()
-    epoch = 0
-    val_loss = float('inf')
-
+    
     for epoch in range(1, args.epochs + 1):
         print(f"\nEpoch {epoch}/{args.epochs}")
         
         # Train
-        train_loss = trainer.train_epoch()
+        train_losses = trainer.train_epoch()
         
-        # Validate
-        val_loss = trainer.validate_epoch()
+        # Validate  
+        val_losses = trainer.validate_epoch()
         
         # Update scheduler
-        trainer.scheduler.step(val_loss)
+        trainer.scheduler.step(val_losses['total'])
         
         # Log to tensorboard
-        writer.add_scalars('Loss', {
-            'train': train_loss,
-            'val': val_loss
-        }, epoch)
+        for loss_type in ['steering', 'throttle', 'brake', 'total']:
+            writer.add_scalars(f'Loss/{loss_type}', {
+                'train': train_losses[loss_type],
+                'val': val_losses[loss_type]
+            }, epoch)
         
         writer.add_scalar('Learning_Rate', 
                          trainer.optimizer.param_groups[0]['lr'], epoch)
         
-        print(f"Train Loss: {train_loss:.6f}")
-        print(f"Val Loss: {val_loss:.6f}")
+        # Print results
+        print(f"Train - Total: {train_losses['total']:.4f}, "
+              f"Steer: {train_losses['steering']:.4f}, "
+              f"Throttle: {train_losses['throttle']:.4f}, "
+              f"Brake: {train_losses['brake']:.4f}")
+        print(f"Val   - Total: {val_losses['total']:.4f}, "
+              f"Steer: {val_losses['steering']:.4f}, "
+              f"Throttle: {val_losses['throttle']:.4f}, "
+              f"Brake: {val_losses['brake']:.4f}")
         print(f"LR: {trainer.optimizer.param_groups[0]['lr']:.2e}")
         
         # Save best model
-        if val_loss < trainer.best_val_loss:
+        if val_losses['total'] < trainer.best_val_loss:
+            trainer.best_val_loss = val_losses['total']
             best_model_path = save_dir / f"{args.run_name}_best.pt"
-            trainer.save_checkpoint(epoch, val_loss, best_model_path)
-            print(f"New best model saved: {val_loss:.6f}")
+            trainer.save_checkpoint(epoch, val_losses, best_model_path)
+            print(f"🏆 New best model saved: {val_losses['total']:.4f}")
         
         # Save checkpoint every 10 epochs
         if epoch % 10 == 0:
             checkpoint_path = save_dir / f"{args.run_name}_epoch_{epoch}.pt"
-            trainer.save_checkpoint(epoch, val_loss, checkpoint_path)
+            trainer.save_checkpoint(epoch, val_losses, checkpoint_path)
         
         # Early stopping check
-        if trainer.early_stop_check(val_loss):
+        if val_losses['total'] < trainer.best_val_loss:
+            trainer.patience_counter = 0
+        else:
+            trainer.patience_counter += 1
+            
+        if trainer.patience_counter >= trainer.patience:
             print(f"Early stopping triggered after {epoch} epochs")
             break
     
     # Save final model
     final_model_path = save_dir / f"{args.run_name}_final.pt"
-    trainer.save_checkpoint(epoch, val_loss, final_model_path)
+    trainer.save_checkpoint(epoch, val_losses, final_model_path)
     
     writer.close()
     
     elapsed_time = time.time() - start_time
-    print(f"\nTraining completed in {elapsed_time:.2f} seconds")
-    print(f"Best validation loss: {trainer.best_val_loss:.6f}")
+    print(f"\n🏁 Multi-Control Training completed in {elapsed_time:.2f} seconds")
+    print(f"🏆 Best validation loss: {trainer.best_val_loss:.4f}")
+    print(f"📁 Models saved to: {save_dir}")
 
 
 if __name__ == '__main__':
     main()
+    # python train.py --batch_size 128 --epochs 50 --use_all_cameras
