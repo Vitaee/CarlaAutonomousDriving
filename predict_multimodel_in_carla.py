@@ -618,5 +618,5 @@ def main():
 
 if __name__ == '__main__':
     main()
-    # python predict_multimodel_carla.py --model_path "models/carla_multi_control_best.pt" --town Town01 --duration 180 --max_speed 10
-    # python predict_multimodel_carla.py --model_path "models/carla_multi_control_best.pt" --town Town02 --duration 180 
+    # python predict_multimodel_in_carla.py --model_path "models/carla_multi_control_best.pt" --town Town01 --duration 180 --max_speed 10
+    # python predict_multimodel_in_carla.py --model_path "models/carla_multi_control_best.pt" --town Town02 --duration 180
