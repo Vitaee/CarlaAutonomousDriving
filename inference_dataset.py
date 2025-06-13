@@ -20,13 +20,12 @@ from model import NvidiaModelTransferLearning
 from dataset_loader import get_inference_dataset
 
 
-class OptimizedDataLoader:
-    """High-performance dataloader optimized for your hardware"""
+class CustomDataLoader:
+    """High-performance dataloader optimized for my pc"""
     
     def __init__(self, dataset, batch_size=256, num_workers=28, prefetch_factor=4):
         """
-        Optimized for your 32-core CPU:
-        - Use 28 workers (leave 4 cores for main process + OS)
+        Optimized for  32-core CPU:
         - Large batch size to utilize 64GB RAM
         - High prefetch factor for continuous data flow
         """
@@ -248,7 +247,7 @@ def main():
     dataset = get_inference_dataset("carla_001")
     
     # Optimized dataloader for your hardware
-    dataloader = OptimizedDataLoader(
+    dataloader = CustomDataLoader(
         dataset, 
         batch_size=128,  # Large batches for your 64GB RAM
         num_workers=24,  # Utilize most of your 32 cores
@@ -323,7 +322,7 @@ def main():
             sample_count += len(batch_predictions)
             
             # Visualization for last sample in batch (optional)
-            if show_visualization and batch_idx % 5 == 0:  # Every 5th batch
+            if batch_idx % 5 == 0:  # Every 5th batch
                 last_image = batch_images[-1].cpu().permute(1, 2, 0).numpy()
                 last_image = (last_image * np.array([0.229, 0.224, 0.225]) + np.array([0.485, 0.456, 0.406]))
                 last_image = np.clip(last_image, 0, 1)
@@ -345,6 +344,9 @@ def main():
                 print(f"⚡ Speed: {samples_per_sec:.1f} samples/sec | {current_metrics.get('fps', 0):.1f} FPS")
                 print(f"📊 MAE: {np.degrees(current_metrics.get('mae', 0)):.3f}° | R²: {current_metrics.get('r2_score', 0):.4f}")
                 print(f"🎯 Direction Acc: {current_metrics.get('direction_accuracy', 0):.1%} | ±5°: {current_metrics.get('angle_accuracy_5deg', 0):.1%}")
+            
+                            
+                                
             
             # Handle keyboard input (non-blocking)
             key = cv2.waitKey(1) & 0xFF
@@ -369,6 +371,7 @@ def main():
         print(f"\n🏁 Evaluation completed in {total_time:.2f} seconds")
         
         final_metrics = metrics_calculator.calculate_metrics_vectorized()
+
         
         if final_metrics:
             print("\n" + "="*80)

@@ -8,6 +8,8 @@ data/*
 datasets/
 dataset/
 dataset_*/
+driving_data*/
+videos/*
 *.db
 *.sqlite
 

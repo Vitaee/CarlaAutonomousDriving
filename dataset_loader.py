@@ -128,7 +128,7 @@ class CarlaDataset(Dataset):
 def get_inference_dataset(dataset_type='carla_001'):
     if dataset_type == 'carla_001':
         return CarlaDataset(
-            root_dir="data/dataset_carla_001_Town01",
+            root_dir="data/dataset_carla_001_Town02",
             use_all_cameras=True
         )
     else:
