@@ -8,7 +8,69 @@ from pathlib import Path
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-CAM_OFFSET = {"left": 0.10, "center": 0.0, "right": -0.10}
+CAM_OFFSET = {"left": 0.15, "center": 0.0, "right": -0.15}
+
+class RealWorldDataset(Dataset):
+    """Dataset for real-world driving images with data.txt steering angles"""
+    
+    def __init__(self, root_dir="driving_dataset"):
+        self.root_dir = Path(root_dir)
+        
+        # Load data.txt file
+        data_file = self.root_dir / "data.txt"
+        self.data = []
+        
+        if data_file.exists():
+            with open(data_file, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) >= 2:
+                        filename = parts[0]
+                        steering_angle = float(parts[1])
+                        # Convert from degrees to radians (model expects radians)
+                        steering_angle_rad = np.radians(steering_angle)
+                        
+                        # Check if image file exists
+                        image_path = self.root_dir / filename
+                        if image_path.exists():
+                            self.data.append({
+                                'filename': filename,
+                                'steering_angle': steering_angle_rad,
+                                'image_path': image_path
+                            })
+        
+        # Data augmentation pipeline for inference (minimal processing)
+        self.transform = A.Compose([
+            A.Resize(66, 200),  # Nvidia model input size
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            ToTensorV2()
+        ])
+        
+        print(f"Loaded {len(self.data)} real-world samples from {root_dir}")
+        if len(self.data) > 0:
+            steering_angles = [item['steering_angle'] for item in self.data]
+            print(f"  Steering angle range: [{np.degrees(min(steering_angles)):.1f}°, {np.degrees(max(steering_angles)):.1f}°]")
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        item = self.data[idx]
+        
+        # Load image
+        image = cv2.imread(str(item['image_path']))
+        if image is None:
+            raise FileNotFoundError(f"Could not load image: {item['image_path']}")
+        
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        
+        # Apply transforms
+        transformed = self.transform(image=image)
+        image = transformed['image']
+        
+        steering_angle = item['steering_angle']
+        
+        return image, torch.tensor(steering_angle, dtype=torch.float32)
 
 class CarlaDataset(Dataset):
     def __init__(self, root_dir, csv_file="steering_data.csv", use_all_cameras=True):
@@ -107,7 +169,7 @@ class CarlaDataset(Dataset):
         # Get steering angle with camera-specific correction
         steering_angle = float(row['steering_angle'])
         # Apply camera offset correction
-        steering_angle += CAM_OFFSET[camera_pos]
+        #steering_angle += CAM_OFFSET[camera_pos]
         
         # Apply transforms with replay tracking
         transformed = self.transform(image=image)
@@ -128,11 +190,18 @@ class CarlaDataset(Dataset):
 def get_inference_dataset(dataset_type='carla_001'):
     if dataset_type == 'carla_001':
         return CarlaDataset(
-            root_dir="data/dataset_carla_001_Town02",
+            root_dir="data_weathers/dataset_carla_001_Town01",
+            use_all_cameras=True
+        )
+    elif dataset_type == 'real_world':
+        return RealWorldDataset(root_dir="driving_dataset")
+    elif dataset_type == 'real_dataset':
+        return CarlaDataset(
+            root_dir="driving_dataset",
             use_all_cameras=True
         )
     else:
-        raise ValueError(f"Invalid dataset type: {dataset_type}")
+        raise ValueError(f"Invalid dataset type: {dataset_type}. Valid options: 'carla_001', 'real_world', 'real_dataset'")
 
 def get_full_dataset_loader(dataset_type='carla_001') -> DataLoader:
     ds = get_inference_dataset(dataset_type)

@@ -48,3 +48,6 @@ carla_steering*
 *.pth.tar.gz.part.1
 
 presentation_plots/*
+
+
+analysis_output/*

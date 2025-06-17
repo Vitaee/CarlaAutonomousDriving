@@ -19,6 +19,11 @@ class CarlaDataCollector:
         self.data_queue = queue.Queue()
         self.lock = threading.Lock()
 
+        # Weather scheduling
+        # The weather will transition through these presets in order as data collection progresses.
+        # You can change the list or the order to suit your needs.
+        self.weather_order = ['sunny', 'foggy', 'rainy', 'night']
+
         self.client = carla.Client(self.host, self.port) # type: ignore
         self.client.set_timeout(20.0)
         
@@ -37,15 +42,8 @@ class CarlaDataCollector:
             time.sleep(3)
             
             # Set weather to sunny clear sky
-            weather = carla.WeatherParameters( # type: ignore
-                cloudiness=0.0,
-                precipitation=0.0,
+            weather = carla.WeatherParameters( 
                 sun_altitude_angle=70.0,
-                sun_azimuth_angle=0.0,
-                precipitation_deposits=0.0,
-                wind_intensity=0.0,
-                fog_density=0.0,
-                wetness=0.0
             )
             world.set_weather(weather)
 
@@ -198,7 +196,7 @@ class CarlaDataCollector:
         print(f"Thread {thread_id}: Starting data collection for {town_name}")
         
         # Create dataset directory
-        dataset_path = Path(f'data/dataset_carla_001_{town_name}')
+        dataset_path = Path(f'data_weathers/dataset_carla_001_{town_name}')
         dataset_path.mkdir(parents=True, exist_ok=True)
         
         # CSV file setup
@@ -232,6 +230,13 @@ class CarlaDataCollector:
             frame_count = 0
             start_time = time.time()
             
+            # ------------------------------------------------------------------
+            # Dynamic weather scheduling setup
+            # ------------------------------------------------------------------
+            phase_size = max(1, self.max_frames // len(self.weather_order))
+            current_phase = 0
+            self._apply_weather(world, self.weather_order[current_phase])
+
             print(f"Thread {thread_id}: Starting data collection loop for {town_name}")
             
             while frame_count < self.max_frames:
@@ -260,6 +265,16 @@ class CarlaDataCollector:
                         
                         if frame_count % 500 == 0:
                             print(f"Thread {thread_id} ({town_name}): Collected {frame_count} frames")
+                        
+                        # ------------------------------------------------------
+                        # Check whether it is time to advance to the next weather
+                        # ------------------------------------------------------
+                        if (current_phase < len(self.weather_order) - 1 and 
+                            frame_count >= (current_phase + 1) * phase_size):
+                            current_phase += 1
+                            next_weather = self.weather_order[current_phase]
+                            self._apply_weather(world, next_weather)
+                            print(f"Thread {thread_id} ({town_name}): Weather changed to {next_weather} at frame {frame_count}")
                         
                         # Reset images
                         latest_images = {pos: None for pos in ['center', 'left', 'right']}
@@ -335,9 +350,55 @@ class CarlaDataCollector:
         
         print("Data collection completed for all towns!")
 
+    # ------------------------------------------------------------------
+    # Weather helpers
+    # ------------------------------------------------------------------
+
+    def _get_weather_preset(self, weather_type):
+        """Return a CARLA WeatherParameters preset for the given weather_type string.
+
+        Uses built-in CARLA presets where they exist and falls back to
+        constructing a custom WeatherParameters object otherwise."""
+
+        # Sunny — built-in clear daylight.
+        if weather_type == 'sunny':
+            return carla.WeatherParameters.ClearNoon
+
+        # Foggy — create our own parameters because CARLA does not ship a fog-only preset.
+        if weather_type == 'foggy':
+            return carla.WeatherParameters(
+                cloudiness=10.0,
+                precipitation=0.0,
+                sun_altitude_angle=45.0,
+                fog_density=75.0,
+                fog_distance=0.0,
+                wetness=0.0,
+                wind_intensity=0.0
+            )
+
+        # Rainy — moderate rain during noon.
+        if weather_type == 'rainy':
+            return carla.WeatherParameters.MidRainyNoon
+
+        # Night — clear night preset provided by CARLA.
+        if weather_type == 'night':
+            return carla.WeatherParameters.ClearNight
+
+        # Default fallback.
+        return carla.WeatherParameters.ClearNoon
+
+    def _apply_weather(self, world, weather_type):
+        """Apply the selected weather preset to the world."""
+        try:
+            world.set_weather(self._get_weather_preset(weather_type))
+        except Exception as e:
+            # Fallback to sunny if anything goes wrong
+            print(f"Warning: Failed to apply weather '{weather_type}': {e}. Reverting to sunny.")
+            world.set_weather(carla.WeatherParameters.ClearNoon)
+
 def main():
     # Configuration
-    MAX_FRAMES = 19000
+    MAX_FRAMES = 22000
     HOST = 'localhost'
     BASE_PORT = 2000
     

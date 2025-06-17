@@ -9,6 +9,7 @@ class Config:
     dataset_type: str = "carla_001"
     train_split_size: float = 0.8
     test_split_size: float = 0.2
+    resize: tuple = (66, 200)
     
     # Training settings
     batch_size: int = 128

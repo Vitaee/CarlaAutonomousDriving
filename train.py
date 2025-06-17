@@ -105,10 +105,10 @@ class Trainer:
             return self.patience_counter >= self.patience
 
 
-def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
+def create_data_loaders(batch_size=128, num_workers=32, use_all_cameras=True):
     """Create train and validation data loaders from all CARLA datasets"""
     
-    datasets_path = Path("data")
+    datasets_path = Path("data_weathers") # data
     town_folders = [
         "dataset_carla_001_Town01",
         "dataset_carla_001_Town02", 
@@ -152,11 +152,11 @@ def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
         cumulative_size += len(dataset)
     
     # Create combined sampler
-    combined_sampler = torch.utils.data.WeightedRandomSampler(
+    """combined_sampler = torch.utils.data.WeightedRandomSampler(
         weights=combined_weights,
         num_samples=len(combined_weights),
         replacement=True
-    )
+    )"""
     
     # Split into train/val
     train_size = int(config.train_split_size * len(combined_dataset))
@@ -203,8 +203,8 @@ def create_data_loaders(batch_size=64, num_workers=24, use_all_cameras=True):
 
 def main():
     parser = argparse.ArgumentParser(description="Train CARLA Steering Model")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
-    parser.add_argument("--epochs", type=int, default=50, help="Number of epochs")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size")
+    parser.add_argument("--epochs", type=int, default=60, help="Number of epochs")
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--use_all_cameras", action="store_true", default=True, 
                        help="Use all three cameras (center, left, right)")
@@ -246,7 +246,7 @@ def main():
     writer = SummaryWriter(f'logs/{args.run_name}')
     
     # Create save directory
-    save_dir = Path("checkpoints")
+    save_dir = Path("checkpoints_weathers")
     save_dir.mkdir(exist_ok=True)
     
     print(f"\nStarting training...")
