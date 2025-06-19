@@ -73,9 +73,10 @@ class RealWorldDataset(Dataset):
         return image, torch.tensor(steering_angle, dtype=torch.float32)
 
 class CarlaDataset(Dataset):
-    def __init__(self, root_dir, csv_file="steering_data.csv", use_all_cameras=True):
+    def __init__(self, root_dir, csv_file="steering_data.csv", use_all_cameras=True, use_speed_input=False):
         self.root_dir = Path(root_dir)
         self.use_all_cameras = use_all_cameras
+        self.use_speed_input = use_speed_input
         
         # Load CSV data
         csv_path = self.root_dir / csv_file
@@ -111,7 +112,9 @@ class CarlaDataset(Dataset):
           # Create balanced sampler for steering angles
         self.sampler = self._create_balanced_sampler()
         
+        # Print dataset statistics including speed
         print(f"Loaded {len(self.data)} samples from {root_dir}")
+        self._print_dataset_stats()
     
     def _create_balanced_sampler(self):
         """Create a weighted sampler to balance steering angle distribution"""
@@ -171,6 +174,10 @@ class CarlaDataset(Dataset):
         # Apply camera offset correction
         #steering_angle += CAM_OFFSET[camera_pos]
         
+        # Get speed if using speed input
+        if self.use_speed_input:
+            speed_kmh = float(row['speed_kmh'])
+        
         # Apply transforms with replay tracking
         transformed = self.transform(image=image)
         image = transformed['image']
@@ -183,27 +190,42 @@ class CarlaDataset(Dataset):
                     steering_angle = -steering_angle
                     break
         
-        return image, torch.tensor(steering_angle, dtype=torch.float32)
+        if self.use_speed_input:
+            return image, torch.tensor(speed_kmh, dtype=torch.float32), torch.tensor(steering_angle, dtype=torch.float32)
+        else:
+            return image, torch.tensor(steering_angle, dtype=torch.float32)
     
+    def _print_dataset_stats(self):
+        # Print dataset statistics including speed
+        if self.use_speed_input:
+            speeds = np.array(self.data['speed_kmh'].values, dtype=np.float32)
+            print(f"  Speed range: [{speeds.min():.1f}, {speeds.max():.1f}] km/h")
+            print(f"  Speed mean: {speeds.mean():.1f} km/h, Std: {speeds.std():.1f} km/h")
+        
+        # Also print steering angle stats
+        steering_angles = np.array(self.data['steering_angle'].values, dtype=np.float32)
+        print(f"  Steering angle range: [{np.degrees(steering_angles.min()):.1f}°, {np.degrees(steering_angles.max()):.1f}°]")
+        print(f"  Steering angle mean: {np.degrees(steering_angles.mean()):.1f}°, Std: {np.degrees(steering_angles.std()):.1f}°")
 
-
-def get_inference_dataset(dataset_type='carla_001'):
+def get_inference_dataset(dataset_type='carla_001', use_speed_input=False):
     if dataset_type == 'carla_001':
         return CarlaDataset(
             root_dir="data_weathers/dataset_carla_001_Town01",
-            use_all_cameras=True
+            use_all_cameras=True,
+            use_speed_input=use_speed_input
         )
     elif dataset_type == 'real_world':
         return RealWorldDataset(root_dir="driving_dataset")
     elif dataset_type == 'real_dataset':
         return CarlaDataset(
             root_dir="driving_dataset",
-            use_all_cameras=True
+            use_all_cameras=True,
+            use_speed_input=use_speed_input
         )
     else:
         raise ValueError(f"Invalid dataset type: {dataset_type}. Valid options: 'carla_001', 'real_world', 'real_dataset'")
 
-def get_full_dataset_loader(dataset_type='carla_001') -> DataLoader:
-    ds = get_inference_dataset(dataset_type)
+def get_full_dataset_loader(dataset_type='carla_001', use_speed_input=False) -> DataLoader:
+    ds = get_inference_dataset(dataset_type, use_speed_input=use_speed_input)
     return DataLoader(ds, batch_size=64, shuffle=False, num_workers=24)
 

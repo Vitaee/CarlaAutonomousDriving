@@ -15,17 +15,18 @@ from config import config
 
 
 class Trainer:
-    def __init__(self, model, train_loader, val_loader, device):
+    def __init__(self, model, train_loader, val_loader, device, use_speed_input=False):
         self.model = model.to(device)
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
+        self.use_speed_input = use_speed_input
         
         # Loss and optimizer
         self.criterion = nn.MSELoss()
         backbone, head = [], []
         for n,p in model.named_parameters():
-            (head if n.startswith('regressor') else backbone).append(p)
+            (head if n.startswith('regressor') or n.startswith('speed_embedding') else backbone).append(p)
 
         self.optimizer = optim.Adam([
             {'params': backbone, 'lr': 1e-4},
@@ -49,13 +50,23 @@ class Trainer:
         total_loss = 0.0
         
         with tqdm(self.train_loader, desc="Training", leave=False) as pbar:
-            for batch_idx, (images, targets) in enumerate(pbar):
+            for batch_idx, batch_data in enumerate(pbar):
+                if self.use_speed_input:
+                    images, speeds, targets = batch_data
+                    speeds = speeds.to(self.device, non_blocking=True)
+                else:
+                    images, targets = batch_data
+                    speeds = None
+                
                 images = images.to(self.device, non_blocking=True)
                 targets = targets.to(self.device, non_blocking=True)
                 
                 # Forward pass
                 self.optimizer.zero_grad()
-                outputs = self.model(images)
+                if self.use_speed_input:
+                    outputs = self.model(images, speeds)
+                else:
+                    outputs = self.model(images)
                 loss = self.criterion(outputs, targets)
                 
                 # Backward pass
@@ -73,11 +84,21 @@ class Trainer:
         
         with torch.no_grad():
             with tqdm(self.val_loader, desc="Validation", leave=False) as pbar:
-                for images, targets in pbar:
+                for batch_data in pbar:
+                    if self.use_speed_input:
+                        images, speeds, targets = batch_data
+                        speeds = speeds.to(self.device, non_blocking=True)
+                    else:
+                        images, targets = batch_data
+                        speeds = None
+                    
                     images = images.to(self.device, non_blocking=True)
                     targets = targets.to(self.device, non_blocking=True)
                     
-                    outputs = self.model(images)
+                    if self.use_speed_input:
+                        outputs = self.model(images, speeds)
+                    else:
+                        outputs = self.model(images)
                     loss = self.criterion(outputs, targets)
                     
                     total_loss += loss.item()
@@ -105,7 +126,7 @@ class Trainer:
             return self.patience_counter >= self.patience
 
 
-def create_data_loaders(batch_size=128, num_workers=32, use_all_cameras=True):
+def create_data_loaders(batch_size=128, num_workers=32, use_all_cameras=True, use_speed_input=False):
     """Create train and validation data loaders from all CARLA datasets"""
     
     datasets_path = Path("data_weathers") # data
@@ -127,7 +148,8 @@ def create_data_loaders(batch_size=128, num_workers=32, use_all_cameras=True):
             print(f"Loading dataset: {town_folder}")
             dataset = CarlaDataset(
                 root_dir=str(town_path),
-                use_all_cameras=use_all_cameras
+                use_all_cameras=use_all_cameras,
+                use_speed_input=use_speed_input
             )
             all_datasets.append(dataset)
             all_samplers.append(dataset.sampler)
@@ -208,6 +230,8 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--use_all_cameras", action="store_true", default=True, 
                        help="Use all three cameras (center, left, right)")
+    parser.add_argument("--use_speed_input", action="store_true", default=False,
+                       help="Include speed as model input for speed-conditioned steering")
     parser.add_argument("--run_name", type=str, default="carla_steering", 
                        help="Run name for tensorboard")
     parser.add_argument("--num_workers", type=int, default=24, help="Number of data loader workers")
@@ -226,12 +250,13 @@ def main():
     train_loader, val_loader = create_data_loaders(
         batch_size=args.batch_size,
         num_workers=args.num_workers,
-        use_all_cameras=args.use_all_cameras
+        use_all_cameras=args.use_all_cameras,
+        use_speed_input=args.use_speed_input
     )
     
     # Create model
     print("Creating model...")
-    model = NvidiaModelTransferLearning()
+    model = NvidiaModelTransferLearning(use_speed_input=args.use_speed_input)
     
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
@@ -240,7 +265,7 @@ def main():
     print(f"Trainable parameters: {trainable_params:,}")
     
     # Create trainer
-    trainer = Trainer(model, train_loader, val_loader, device)
+    trainer = Trainer(model, train_loader, val_loader, device, use_speed_input=args.use_speed_input)
     
     # Setup tensorboard
     writer = SummaryWriter(f'logs/{args.run_name}')
@@ -254,6 +279,7 @@ def main():
     print(f"Batch size: {args.batch_size}")
     print(f"Learning rate: {args.lr}")
     print(f"Use all cameras: {args.use_all_cameras}")
+    print(f"Use speed input: {args.use_speed_input}")
     
     start_time = time.time()
     epoch = 0
@@ -286,13 +312,15 @@ def main():
         
         # Save best model
         if val_loss < trainer.best_val_loss:
-            best_model_path = save_dir / f"{args.run_name}_best.pt"
+            suffix = "_speed" if args.use_speed_input else ""
+            best_model_path = save_dir / f"{args.run_name}_best{suffix}.pt"
             trainer.save_checkpoint(epoch, val_loss, best_model_path)
             print(f"New best model saved: {val_loss:.6f}")
         
         # Save checkpoint every 10 epochs
         if epoch % 10 == 0:
-            checkpoint_path = save_dir / f"{args.run_name}_epoch_{epoch}.pt"
+            suffix = "_speed" if args.use_speed_input else ""
+            checkpoint_path = save_dir / f"{args.run_name}_epoch_{epoch}{suffix}.pt"
             trainer.save_checkpoint(epoch, val_loss, checkpoint_path)
         
         # Early stopping check
@@ -301,7 +329,8 @@ def main():
             break
     
     # Save final model
-    final_model_path = save_dir / f"{args.run_name}_final.pt"
+    suffix = "_speed" if args.use_speed_input else ""
+    final_model_path = save_dir / f"{args.run_name}_final{suffix}.pt"
     trainer.save_checkpoint(epoch, val_loss, final_model_path)
     
     writer.close()
@@ -309,6 +338,8 @@ def main():
     elapsed_time = time.time() - start_time
     print(f"\nTraining completed in {elapsed_time:.2f} seconds")
     print(f"Best validation loss: {trainer.best_val_loss:.6f}")
+    if args.use_speed_input:
+        print("🚀 Speed-conditioned model trained! This should perform better at various speeds.")
 
 
 if __name__ == '__main__':

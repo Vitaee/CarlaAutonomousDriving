@@ -107,15 +107,16 @@ class CarlaSteeringModelTester:
         """Load the trained steering model (EfficientNet-B0 based)"""
         print(f"🤖 Loading steering model from {model_path}")
         
-        model = NvidiaModel(
-            pretrained=False,  # Already trained
-            freeze_features=False,
-        )
-
-        """model = NvidiaModelTransferLearning(
+        """model = NvidiaModel(
             pretrained=False,  # Already trained
             freeze_features=False,
         )"""
+
+        model = NvidiaModelTransferLearning(
+            pretrained=False,  # Already trained
+            freeze_features=False,
+            use_speed_input=self.use_speed_input
+        )
         
         if Path(model_path).exists():
             checkpoint = torch.load(model_path, map_location=self.device)
@@ -154,7 +155,7 @@ class CarlaSteeringModelTester:
             time.sleep(3)
             
             # Set clear weather for testing
-            weather = carla.WeatherParameters.MidRainyNoon  #  carla.WeatherParameters.MidRainyNoon  # carla.WeatherParameters.ClearNight
+            weather = carla.WeatherParameters.ClearNoon  #  carla.WeatherParameters.MidRainyNoon  # carla.WeatherParameters.ClearNight
 
             self.world.set_weather(weather)
             time.sleep(2)
@@ -566,7 +567,6 @@ class CarlaSteeringModelTester:
                 throttle=0.0,
                 steer=0.0,
                 brake=0.0,
-                hand_brake=False,
                 reverse=False,
                 manual_gear_shift=False,
                 gear=1
